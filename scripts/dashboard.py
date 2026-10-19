@@ -276,6 +276,13 @@ def metrics_collector_thread():
                     "llama": srv_llama,
                     "crond": srv_crond
                 }
+
+                # 同步写入青龙静态目录，实现 5700 端口同源零鉴权极速直读
+                try:
+                    with open("/ql/static/dist/phone_metrics.json", "w", encoding="utf-8") as pf:
+                        json.dump(latest_metrics, pf, ensure_ascii=False)
+                except Exception:
+                    pass
         except Exception as e:
             time.sleep(1)
 
@@ -547,7 +554,13 @@ INDEX_HTML = """<!DOCTYPE html>
 
     async function fetchMetrics() {
       try {
-        const res = await fetch("/api/metrics");
+        let res;
+        try {
+          res = await fetch("/phone_metrics.json?_t=" + Date.now());
+          if (!res.ok) throw new Error();
+        } catch(e) {
+          res = await fetch("/api/metrics?_t=" + Date.now());
+        }
         const data = await res.json();
 
         // Uptime
@@ -662,6 +675,15 @@ class MetricsHandler(BaseHTTPRequestHandler):
 
 def main():
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动一加 9 手机性能监控看板 (端口 :{PORT})...")
+
+    # 同步输出独立 HTML 至青龙静态目录，支持 5700 端口直接内嵌
+    try:
+        with open("/ql/static/dist/phone-dashboard.html", "w", encoding="utf-8") as f:
+            f.write(INDEX_HTML)
+        print("[*] 已同步部署青龙专属性能页面至 /ql/static/dist/phone-dashboard.html")
+    except Exception as e:
+        print("[!] 写入青龙静态目录失败:", e)
+
     # 启动后台采集线程
     t = threading.Thread(target=metrics_collector_thread, daemon=True)
     t.start()

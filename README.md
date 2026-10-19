@@ -108,6 +108,13 @@ flowchart TB
    - One-click script via `pm disable-user --user 0` freezes 22 pre-installed ColorOS bloatware, tracking, and push notification daemons without bricking risk.
    - Reclaims **1.8GB+ physical RAM**, keeping idle memory headroom at ~4.2GB+.
 
+6. **Native Qinglong Panel Integration (Single Port `:5700`)**
+   - Injected directly into Qinglong (`phone_addon.js`):
+     - **Left Navigation Menu**: Dedicated `📱 手机性能` item opens the full performance view without leaving Qinglong.
+     - **Dashboard Tab**: Adds `⚡ 手机硬件实时性能 (骁龙888)` tab right inside the Qinglong Dashboard with live 1.5s refresh.
+     - **Top Header Capsule**: Real-time status badge showing live temperature, available RAM, and supercore frequency.
+   - All assets (`phone-dashboard.html`, `phone_metrics.json`) are served directly on port `5700` without authentication barriers.
+
 ---
 
 ## 📊 Hardware & Benchmark Performance
@@ -147,6 +154,7 @@ oneplus9-micro-server/
 ├── .gitignore                     # Git ignore rules
 ├── scripts/
 │   ├── dashboard.py               # Zero-dependency real-time telemetry web server (:5701)
+│   ├── phone_addon.js             # Native frontend injection plugin for Qinglong Web UI (:5700)
 │   ├── thermal_guard.py           # Hardware thermal guard daemon with push alert capabilities
 │   ├── optimize_bloatware.sh      # Safe ADB debloat script for ColorOS / Android
 │   └── start_qinglong_daemon.sh   # Triple watchdog daemon for auto-resurrecting services
