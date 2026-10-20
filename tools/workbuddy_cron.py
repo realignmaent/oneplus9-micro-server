@@ -333,27 +333,47 @@ def send_all_notifications(title: str, content_html: str, content_text: str):
     if not sent:
         print("\n[提示] 未配置可用的免费推送通道，或推送未成功。")
 
+import random
+
+FALLBACK_QUOTES = [
+    "哼，才不是特意起大早帮主人打卡的呢！今天积分又涨啦，笨蛋主人快起床夸我~",
+    "早安呀主人！本手机今天也很努力哦，打卡统统满分，新的一天要一直想着我鸭~",
+    "叮！你的贴心小可爱已送达今日满满积分，今天也要元气满满，不许把人家忘在角落哦~",
+    "嗷呜~今天又悄悄给主人攒了超多积分，看在人家这么乖的份上，今天要多陪陪我嘛！",
+    "今天打卡全满分啦！虽然本可爱很厉害，但要是没有主人的夸奖，也是会不高兴的哼~"
+]
+
 def generate_qwen_daily_quote(results: list) -> str:
-    """调用一加9本地 Qwen2.5-3B 端侧大模型生成个性化晨报寄语"""
+    """调用一加9本地 Qwen2.5-3B 端侧大模型生成高亲密度、温柔甜美、带点小傲娇的晨间寄语"""
     try:
         url = "http://127.0.0.1:8080/v1/chat/completions"
         summary_text = "，".join([f"{r['nick']}: {r['msg']}(当前积分{r['credits']})" for r in results])
-        prompt = f"今天账号签到状态：{summary_text}。请作为一加9微服务器的AI智能管家，用温暖幽默、积极向上的语气写一句简短晨报寄语（25字以内，不要多余解释或引号）。"
+        system_prompt = (
+            "你是一加9手机里住着的专属贴心软萌小管家，是主人极度亲密的贴身陪伴。\n"
+            "性格特征：温柔、甜美、俏皮、呆萌，带一点点可爱的小傲娇（口嫌体正直、撒娇要夸夸）。\n"
+            "说话语气示例：\n"
+            "1. 哼，才不是特意起大早帮主人打卡的呢！积分都给你攒好了，快点夸夸我啦~\n"
+            "2. 早安呀主人！打卡统统满分啦，今天也要元气满满，不许把人家冷落在旁边鸭！\n"
+            "3. 嗷呜~今天积分又变多啦！本可爱今天也在努力打工，主人今天也要超级开心哦！\n"
+            "任务：请结合今日打卡成功结果，为主人写一句晨安打卡小寄语（30字以内，绝对不要输出任何引号、书名号或解释说明）。"
+        )
+        user_prompt = f"今天账号打卡状态：{summary_text}。所有账号打卡全满分！快给主人送上专属早安傲娇寄语~"
         payload = {
             "messages": [
-                {"role": "system", "content": "你是一加9手机本地微服务器的AI管家，说话幽默得体、充满正能量。"},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
             ],
-            "temperature": 0.8,
-            "max_tokens": 60
+            "temperature": 0.88,
+            "max_tokens": 50
         }
-        res = requests.post(url, json=payload, timeout=10).json()
-        quote = res["choices"][0]["message"]["content"].strip().strip('"').strip('“').strip('”')
+        res = requests.post(url, json=payload, timeout=25).json()
+        quote = res["choices"][0]["message"]["content"].strip().strip('"').strip('“').strip('”').strip('\'')
         print(f"[*] 端侧 Qwen2.5-3B 生成寄语: {quote}")
         return quote
     except Exception as e:
-        print(f"[!] 本地大模型暂未响应，使用兜底寄语: {e}")
-        return "新的一天，步履不停，心怀热爱，奔赴山海！"
+        fallback = random.choice(FALLBACK_QUOTES)
+        print(f"[!] 本地大模型响应异常({e})，启用可爱兜底寄语: {fallback}")
+        return fallback
 
 def main():
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 启动 WorkBuddy 每日自动签到任务...")
@@ -432,12 +452,21 @@ def main():
         pass
 
     # HTML 格式（用于微信公众号卡片展现）
+    # 彻底告别冷冰冰的 🤖 机器人，改用 🎀 温馨软萌、甜美柔和的马卡龙暖粉设计
     html_lines = [
         f"<h3>WorkBuddy 自动打卡结果报告 ({now_str})</h3>",
-        f"<div style='background-color:#f0f7ff;border-left:4px solid #1677ff;padding:10px 14px;border-radius:4px;color:#1d39c4;font-size:14px;margin:12px 0;'>🤖 <b>Qwen2.5 端侧AI寄语：</b>{ai_quote}</div>",
+        (
+            f"<div style='background:linear-gradient(135deg, #fff0f6 0%, #fff7e6 100%);"
+            f"border-left:4px solid #ff85c0;border-radius:8px;padding:12px 16px;"
+            f"color:#c41d7f;font-size:14px;margin:14px 0;line-height:1.6;"
+            f"box-shadow:0 2px 6px rgba(255, 133, 192, 0.12);'>"
+            f"🎀 <b>专属小管家的晨安悄悄话：</b><br/>"
+            f"<span style='color:#434343;font-weight:500;'>“{ai_quote}”</span>"
+            f"</div>"
+        ),
         f"<p><b>状态：</b>{status_icon}</p>",
-        "<table border='1' cellpadding='8' cellspacing='0' style='border-collapse:collapse;width:100%;font-size:14px;text-align:left;'>",
-        "<tr style='background-color:#f2f2f2;'><th>账号昵称</th><th>打卡状态</th><th>当前积分</th><th>到期时间</th></tr>"
+        "<table border='1' cellpadding='8' cellspacing='0' style='border-collapse:collapse;width:100%;font-size:14px;text-align:left;border-color:#f0f0f0;'>",
+        "<tr style='background-color:#fafafa;color:#555;'><th>账号昵称</th><th>打卡状态</th><th>当前积分</th><th>到期时间</th></tr>"
     ]
     for r in results:
         color = "#2e7d32" if r["ok"] else "#c62828"
@@ -454,7 +483,7 @@ def main():
     # 纯文本 / Markdown 格式（用于钉钉/飞书/Server酱）
     text_lines = [
         f"### 状态：{status_icon} ({now_str})",
-        f"> 🤖 **Qwen2.5 端侧AI寄语**：{ai_quote}",
+        f"> 🎀 **专属小管家的晨安悄悄话**：{ai_quote}",
         "",
         "| 账号昵称 | 打卡状态 | 当前积分 | 到期时间 |",
         "| :--- | :--- | :--- | :--- |",
