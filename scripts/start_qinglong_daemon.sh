@@ -24,3 +24,15 @@ if ! pgrep -f "dashboard.py" > /dev/null; then
     echo "[$(date)] 启动手机性能监控看板服务 (5701)..."
     nohup proot-distro login debian -- bash -c 'python3 /ql/data/scripts/dashboard.py' > /data/data/com.termux/files/home/dashboard.log 2>&1 &
 fi
+
+# 6. 检查 WorkBuddy 上游网关 wb2api 是否已启动，若未启动则拉起 (端口 7863)
+if ! pgrep -f "wb2api" > /dev/null; then
+    echo "[$(date)] 启动 WorkBuddy 上游网关 (7863)..."
+    nohup proot-distro login debian -- bash -c 'cd /opt/workbuddy-manager/upstream && ./wb2api -config config.json' > /data/data/com.termux/files/home/wb2api.log 2>&1 &
+fi
+
+# 7. 检查 WorkBuddy Web 管理端是否已启动，若未启动则拉起 (端口 7864)
+if ! pgrep -f "server.main:app" > /dev/null; then
+    echo "[$(date)] 启动 WorkBuddy 管理面板 (7864)..."
+    nohup proot-distro login debian -- bash -c 'cd /opt/workbuddy-manager && python3 -m uvicorn server.main:app --host 0.0.0.0 --port 7864 --env-file .env' > /data/data/com.termux/files/home/manager.log 2>&1 &
+fi
