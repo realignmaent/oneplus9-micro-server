@@ -45,6 +45,7 @@
 | **青龙自动化面板** | **:5700** | Node.js Express + UmiJS | `/ql` | 定时任务平台，注入了 `phone_addon.js` 全景性能看板与状态胶囊 |
 | **实时硬件遥测看板** | **:5701** | 原生 Python 3 `dashboard.py` | `/ql/data/scripts/dashboard.py` | 零依赖秒级采集 `/sys` 温度、内存、频率，写出 `phone_metrics.json` |
 | **端侧大模型 API** | **:8080** | llama-server ARM 原生 | `/ql/data/models/` | 加载 `qwen2.5-3b-instruct-q4_k_m.gguf` 进行本地脱机推理 |
+| **QoderGateway 网关** | **:5050** | Python 3.11 FastAPI + Uvicorn | `/opt/qodergateway/.env` | Qoder 多账号 OpenAI 接口转换与 WebUI 控制台，文档站与账号轮转 |
 | **Termux SSH** | **:8022** | OpenSSH | `~/.ssh/authorized_keys` | 手机远程管理终端通道 |
 
 ---
@@ -53,7 +54,7 @@
 
 1. **统一自愈守护中心**：
    * 手机守护脚本收敛于：`/data/data/com.termux/files/home/start_qinglong_daemon.sh`。
-   * 该脚本由 Termux crond 巡检或开机拉起，自动守护青龙、大模型、性能看板、wb2api 与 workbuddy 管理端 5 大服务进程。
+   * 该脚本由 Termux crond 巡检或开机拉起，自动守护青龙、大模型、性能看板、wb2api、workbuddy 管理端及 QoderGateway 等核心服务进程。
 2. **数据无损迁移原则**：
    * Web 前端严禁在手机端重复 npm 安装与构建，直接使用预编译产物 `web/out/` 由后端静态挂载。
    * SQLite 数据库（`manager.db`）、账号凭据（`upstream/auths/*.json`）和密码哈希（`users.json`）在 Windows 与 Linux 之间完全二进制通用，平移即可无缝复用。

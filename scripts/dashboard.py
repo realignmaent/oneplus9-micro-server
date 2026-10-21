@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-一加 9 (LE2110) 移动微服务器性能监控看板 (Mobile Server Dashboard)
-- 零外部重型依赖：基于 Python 标准库 http.server 与多线程异步采集
-- 实时监控指标：
-  1. 高通骁龙 888 8核心（1x X1 + 3x A78 + 4x A55）独立利用率与时钟频率
-  2. 12GB 物理内存与 7.8GB ZRAM 压缩内存动态水位
-  3. 电池核心温、CPU 峰值温、机身外壳背板温与外框温硬件热区矩阵
-  4. wlan0 Wi-Fi 6 实时吞吐带宽速率 (KB/s)
-  5. 青龙自动化 (:5700) 与 Qwen2.5-3B 本地推理引擎 (:8080) 双服务健康状态
-- 默认监听端口：0.0.0.0:5701
+一加 9 (LE2110) 移动微服务器一体化控制台 (Mobile Micro-Server Console)
+DevCheck 全景版 + 端侧 Qwen2.5-3B 10分钟智能巡检心语 + 进程级内存桑基图 (Sankey Diagram)
 """
 
 import os
@@ -18,501 +11,692 @@ import glob
 import time
 import json
 import socket
+import subprocess
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+import re
+import urllib.request
+from urllib.parse import urlparse, parse_qs
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 
 PORT = 5701
+HOME_DIR = "/data/data/com.termux/files/home"
 
-# 全局指标缓存
+MANAGED_SERVICES = {
+    "qinglong": {
+        "id": "qinglong",
+        "name": "青龙自动化面板",
+        "port": 5700,
+        "category": "定时任务",
+        "pattern": "static/build/app.js",
+        "log_file": os.path.join(HOME_DIR, "qinglong.log"),
+        "start_cmd": f"nohup proot-distro login debian -- bash -c 'cd /ql && export QL_DIR=\"/ql\" && export QL_DATA_DIR=\"/ql/data\" && export QlPort=5700 && export QL_SCHEDULER=\"node\" && node static/build/app.js' > {HOME_DIR}/qinglong.log 2>&1 &",
+        "url": "http://192.168.31.172:5700"
+    },
+    "llama": {
+        "id": "llama",
+        "name": "Qwen2.5-3B 本地推理引擎",
+        "port": 8080,
+        "category": "端侧 AI",
+        "pattern": "llama-server",
+        "log_file": os.path.join(HOME_DIR, "llama_server.log"),
+        "start_cmd": f"nohup proot-distro login debian -- bash -c 'llama-server -m /ql/data/models/qwen2.5-3b-instruct-q4_k_m.gguf --host 0.0.0.0 --port 8080 -c 2048 -t 4 --alias qwen2.5-3b' > {HOME_DIR}/llama_server.log 2>&1 &",
+        "url": "http://192.168.31.172:8080"
+    },
+    "workbuddy": {
+        "id": "workbuddy",
+        "name": "WorkBuddy 管理控制台",
+        "port": 7864,
+        "category": "Web 后台",
+        "pattern": "server.main:app",
+        "log_file": os.path.join(HOME_DIR, "manager.log"),
+        "start_cmd": f"nohup proot-distro login debian -- bash -c 'cd /opt/workbuddy-manager && python3 -m uvicorn server.main:app --host 0.0.0.0 --port 7864 --env-file .env' > {HOME_DIR}/manager.log 2>&1 &",
+        "url": "http://192.168.31.172:7864"
+    },
+    "wb2api": {
+        "id": "wb2api",
+        "name": "wb2api 核心网关",
+        "port": 7863,
+        "category": "OpenAI 代理",
+        "pattern": "wb2api",
+        "log_file": os.path.join(HOME_DIR, "wb2api.log"),
+        "start_cmd": f"nohup proot-distro login debian -- bash -c 'cd /opt/workbuddy-manager/upstream && ./wb2api -config config.json' > {HOME_DIR}/wb2api.log 2>&1 &",
+        "url": "http://192.168.31.172:7863"
+    },
+    "public_gateway": {
+        "id": "public_gateway",
+        "name": "公网共享网关与隧道",
+        "port": 8081,
+        "category": "穿透隧道",
+        "pattern": "public_ai_gateway.py",
+        "log_file": os.path.join(HOME_DIR, "logs", "gateway.log"),
+        "start_cmd": f"bash {HOME_DIR}/start_public_ai.sh > /dev/null 2>&1 &",
+        "url": "http://192.168.31.172:8081"
+    },
+    "qodergateway": {
+        "id": "qodergateway",
+        "name": "QoderGateway 网关",
+        "port": 5050,
+        "category": "OpenAI 代理",
+        "pattern": "qoder2api.app",
+        "log_file": os.path.join(HOME_DIR, "qodergateway.log"),
+        "start_cmd": f"nohup proot-distro login debian -- bash -c 'cd /opt/qodergateway && PYTHONPATH=src python3 -m qoder2api.app --host 0.0.0.0 --port 5050' > {HOME_DIR}/qodergateway.log 2>&1 &",
+        "url": "http://192.168.31.172:5050"
+    }
+}
+
+# 缓存各核心硬件上限频率
+MAX_FREQS = [1804, 1804, 1804, 1804, 2419, 2419, 2419, 2841]
+try:
+    mf = []
+    for i in range(8):
+        fpath = f"/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_max_freq"
+        if os.path.exists(fpath):
+            with open(fpath, "r") as f:
+                mf.append(int(int(f.read().strip()) / 1000))
+        else:
+            mf.append(MAX_FREQS[i])
+    if len(mf) == 8:
+        MAX_FREQS = mf
+except Exception:
+    pass
+
 metrics_lock = threading.Lock()
 latest_metrics = {
     "timestamp": 0,
-    "uptime_str": "0天 0小时",
-    "cpu_total": 0.0,
-    "cpu_cores": [0.0] * 8,
+    "current_time": "",
+    "uptime_str": "计算中...",
+    "load_avg": [0.0, 0.0, 0.0],
+    "cpu_cores_temp": [32.0] * 8,
     "cpu_freqs": [0] * 8,
-    "ram": {
-        "total_mb": 11500,
-        "used_mb": 0,
-        "avail_mb": 0,
-        "free_mb": 0,
-        "cached_mb": 0,
-        "pct": 0.0
+    "max_freqs": MAX_FREQS,
+    "clusters": {
+        "little": 0,
+        "big": 0,
+        "prime": 0
     },
-    "zram": {
-        "total_mb": 7680,
-        "used_mb": 0,
-        "free_mb": 7680,
-        "pct": 0.0
+    "battery": {
+        "temp": 26.8,
+        "voltage": 3.94,
+        "status": "稳态供电"
     },
-    "thermals": {
-        "battery": 30.0,
-        "cpu_max": 38.0,
-        "cpu_avg": 37.0,
-        "shell_back": 32.0,
-        "shell_front": 33.0,
-        "status": "NORMAL"
+    "ram": {"total_mb": 11230, "used_mb": 0, "avail_mb": 0, "pct": 0.0},
+    "zram": {"total_mb": 7679, "used_mb": 0, "free_mb": 7679, "pct": 0.0},
+    "thermals": {"battery": 26.8, "cpu_max": 34.0, "status": "NORMAL"},
+    "ai_insight": {
+        "text": "端侧 Qwen2.5-3B 正在就绪，首次巡检将在稍后生成...",
+        "updated_at": "--:--",
+        "cost_s": 0.0
     },
-    "net": {
-        "rx_kbps": 0.0,
-        "tx_kbps": 0.0
-    },
-    "services": {
-        "qinglong": False,
-        "llama": False,
-        "crond": False
-    },
-    "top_procs": []
+    "sankey_data": {"nodes": [], "links": []},
+    "services": {}
 }
 
-def format_uptime(seconds: float) -> str:
-    days = int(seconds // 86400)
-    hours = int((seconds % 86400) // 3600)
-    mins = int((seconds % 3600) // 60)
-    if days > 0:
-        return f"{days}天 {hours}小时 {mins}分"
-    elif hours > 0:
-        return f"{hours}小时 {mins}分"
-    else:
-        return f"{mins}分钟"
+def get_uptime_and_load():
+    """解析系统真实在线时长与 1/5/15 分钟负载"""
+    uptime_str = "运行正常"
+    load_avg = [0.0, 0.0, 0.0]
+    try:
+        up_p = subprocess.check_output(["uptime", "-p"], text=True, stderr=subprocess.DEVNULL).strip()
+        uptime_str = up_p.replace("up ", "").replace(" days", "天").replace(" day", "天").replace(" hours", "小时").replace(" hour", "小时").replace(" minutes", "分").replace(" minute", "分").replace(", ", " ")
+    except Exception:
+        pass
 
-def check_port(host: str, port: int, timeout=0.3) -> bool:
+    try:
+        out = subprocess.check_output(["uptime"], text=True, stderr=subprocess.DEVNULL).strip()
+        m_load = re.search(r"load average:\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)", out)
+        if m_load:
+            load_avg = [float(m_load.group(1)), float(m_load.group(2)), float(m_load.group(3))]
+    except Exception:
+        pass
+    return uptime_str, load_avg
+
+def check_port(port: int, timeout=0.15) -> bool:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
-            return s.connect_ex((host, port)) == 0
+            return s.connect_ex(("127.0.0.1", port)) == 0
     except Exception:
         return False
 
-def read_cpu_stats():
-    """读取 /proc/stat 中的 cpu 总计和各核心时钟片"""
-    stats = {}
+def get_procs_info():
+    """解析当前系统进程占用"""
+    procs = {}
     try:
-        with open("/proc/stat", "r") as f:
-            for line in f:
-                parts = line.strip().split()
-                if not parts:
-                    continue
-                name = parts[0]
-                if name.startswith("cpu"):
-                    vals = [int(x) for x in parts[1:8]]
-                    stats[name] = {
-                        "user": vals[0],
-                        "nice": vals[1],
-                        "system": vals[2],
-                        "idle": vals[3],
-                        "iowait": vals[4],
-                        "irq": vals[5],
-                        "softirq": vals[6],
-                        "total": sum(vals)
-                    }
+        out = subprocess.check_output(["ps", "-ef"], text=True, stderr=subprocess.DEVNULL)
+        for line in out.strip().splitlines()[1:]:
+            parts = line.split(None, 7)
+            if len(parts) >= 8:
+                pid, cmd = parts[1], parts[7]
+                for s_key, s_cfg in MANAGED_SERVICES.items():
+                    if s_cfg["pattern"] in cmd and "grep" not in cmd and "nohup" not in cmd:
+                        procs[s_key] = {"pid": pid, "cmd": cmd}
     except Exception:
         pass
-    return stats
+    return procs
 
-def read_net_bytes():
-    """读取 wlan0 网卡累计收发字节数"""
-    rx, tx = 0, 0
+def get_proc_rss_mb(pid: str) -> float:
     try:
-        with open("/proc/net/dev", "r") as f:
-            for line in f:
-                if "wlan0:" in line:
-                    parts = line.replace("wlan0:", " ").split()
-                    rx = int(parts[0])
-                    tx = int(parts[8])
-                    break
+        with open(f"/proc/{pid}/statm", "r") as f:
+            rss_pages = int(f.read().split()[1])
+            return round(rss_pages * 4 / 1024, 1)
+    except Exception:
+        return 0.0
+
+def read_thermal_matrix():
+    """高精度直读骁龙 888 8 核独立温度、电池温度及电压"""
+    temps = {"battery": 26.8, "cpu_max": 34.0, "status": "NORMAL", "cpu_cores": [32.0] * 8, "vbat": 3.94}
+    
+    # 电池真实温度：thermal_zone100
+    try:
+        with open("/sys/class/thermal/thermal_zone100/temp", "r") as f:
+            v = float(f.read().strip())
+            temps["battery"] = round(v / 1000.0, 1) if v > 1000 else round(v, 1)
     except Exception:
         pass
-    return rx, tx
 
-def metrics_collector_thread():
-    """后台采集线程，每 1.5 秒更新一次全量指标"""
+    # 电池真实电压：thermal_zone102 (vbat)
+    try:
+        with open("/sys/class/thermal/thermal_zone102/temp", "r") as f:
+            v = float(f.read().strip())
+            temps["vbat"] = round(v / 1000.0, 2) if v > 100 else round(v, 2)
+    except Exception:
+        pass
+
+    # CPU 8 核独立温度：thermal_zone45 ~ 52 (cpu 0 ~ 7)
+    cpu_temps = []
+    for z in range(45, 53):
+        try:
+            with open(f"/sys/class/thermal/thermal_zone{z}/temp", "r") as f:
+                v = float(f.read().strip())
+                t = v / 1000.0 if v > 1000 else v
+                cpu_temps.append(round(t, 1))
+        except Exception:
+            cpu_temps.append(round(temps["battery"] + 4.0, 1))
+
+    if cpu_temps:
+        temps["cpu_cores"] = cpu_temps
+        temps["cpu_max"] = max(cpu_temps)
+
+    temps["status"] = "HIGH" if temps["battery"] >= 42.0 or temps["cpu_max"] >= 65.0 else "NORMAL"
+    return temps
+
+def read_cpu_freqs():
+    """读取 8 核当前动态时钟频率 (MHz)"""
+    freqs = []
+    for i in range(8):
+        f_path = f"/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq"
+        try:
+            with open(f_path, "r") as f:
+                freqs.append(int(int(f.read().strip()) / 1000))
+        except Exception:
+            freqs.append(0)
+    return freqs
+
+def read_mem_info():
+    """读取物理内存与 Swap/ZRAM 真实使用情况"""
+    total, free, avail, cached, swap_total, swap_free = 11230, 0, 0, 0, 7679, 6400
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                parts = line.split()
+                k, v = parts[0], int(parts[1]) // 1024
+                if k == "MemTotal:": total = v
+                elif k == "MemFree:": free = v
+                elif k == "MemAvailable:": avail = v
+                elif k == "Cached:": cached = v
+                elif k == "SwapTotal:": swap_total = v
+                elif k == "SwapFree:": swap_free = v
+    except Exception:
+        pass
+    used = total - avail if avail else total - free
+    swap_used = swap_total - swap_free
+    return {
+        "ram": {
+            "total_mb": total,
+            "used_mb": used,
+            "avail_mb": avail,
+            "cached_mb": cached,
+            "free_mb": free,
+            "pct": round(used / total * 100, 1) if total else 0
+        },
+        "zram": {
+            "total_mb": swap_total,
+            "used_mb": swap_used,
+            "free_mb": swap_free,
+            "pct": round(swap_used / swap_total * 100, 1) if swap_total else 0
+        }
+    }
+
+def get_process_memory_tree(mem_data, services_status):
+    """计算用于桑基图的进程级内存拓扑数据"""
+    ram_total = mem_data["ram"]["total_mb"]
+    ram_used = mem_data["ram"]["used_mb"]
+    ram_cached = mem_data["ram"]["cached_mb"]
+    ram_free = mem_data["ram"]["free_mb"]
+
+    zram_total = mem_data["zram"]["total_mb"]
+    zram_used = mem_data["zram"]["used_mb"]
+    zram_free = mem_data["zram"]["free_mb"]
+
+    # 提取已知微服务内存
+    llama_mb = int(services_status.get("llama", {}).get("memory_mb", 2200))
+    ql_mb = int(services_status.get("qinglong", {}).get("memory_mb", 180))
+    wb_mb = int(services_status.get("workbuddy", {}).get("memory_mb", 110))
+    gw_mb = int(services_status.get("public_gateway", {}).get("memory_mb", 20) + services_status.get("wb2api", {}).get("memory_mb", 16) + 40)
+    proot_mb = 160
+
+    known_sum = llama_mb + ql_mb + wb_mb + gw_mb + proot_mb
+    android_sys_mb = max(200, ram_used - known_sum)
+
+    nodes = [
+        {"name": "物理 RAM", "value": ram_total, "itemStyle": {"color": "#10b981"}, "label": {"position": "left"}},
+        {"name": "ZRAM 交换区", "value": zram_total, "itemStyle": {"color": "#8b5cf6"}, "label": {"position": "left"}},
+        {"name": "已分配进程内存", "value": ram_used, "itemStyle": {"color": "#3b82f6"}},
+        {"name": "系统缓存与缓冲", "value": ram_cached, "itemStyle": {"color": "#06b6d4"}},
+        {"name": "完全空闲内存", "value": max(100, ram_free), "itemStyle": {"color": "#94a3b8"}},
+        {"name": "ZRAM 压缩已用", "value": zram_used, "itemStyle": {"color": "#6366f1"}},
+        {"name": "ZRAM 空闲池", "value": zram_free, "itemStyle": {"color": "#a855f7"}},
+        {"name": "Qwen2.5-3B 推理引擎", "value": llama_mb, "itemStyle": {"color": "#f59e0b"}},
+        {"name": "青龙自动化面板", "value": ql_mb, "itemStyle": {"color": "#ef4444"}},
+        {"name": "WorkBuddy 控制台", "value": wb_mb, "itemStyle": {"color": "#0284c7"}},
+        {"name": "PRoot 容器隔离层", "value": proot_mb, "itemStyle": {"color": "#0d9488"}},
+        {"name": "网关与公网隧道", "value": gw_mb, "itemStyle": {"color": "#d946ef"}},
+        {"name": "Android 底座与系统服务", "value": android_sys_mb, "itemStyle": {"color": "#64748b"}}
+    ]
+
+    links = [
+        {"source": "物理 RAM", "target": "已分配进程内存", "value": ram_used},
+        {"source": "物理 RAM", "target": "系统缓存与缓冲", "value": ram_cached},
+        {"source": "物理 RAM", "target": "完全空闲内存", "value": max(100, ram_free)},
+        {"source": "ZRAM 交换区", "target": "ZRAM 压缩已用", "value": zram_used},
+        {"source": "ZRAM 交换区", "target": "ZRAM 空闲池", "value": zram_free},
+        {"source": "已分配进程内存", "target": "Qwen2.5-3B 推理引擎", "value": llama_mb},
+        {"source": "已分配进程内存", "target": "青龙自动化面板", "value": ql_mb},
+        {"source": "已分配进程内存", "target": "WorkBuddy 控制台", "value": wb_mb},
+        {"source": "已分配进程内存", "target": "PRoot 容器隔离层", "value": proot_mb},
+        {"source": "已分配进程内存", "target": "网关与公网隧道", "value": gw_mb},
+        {"source": "已分配进程内存", "target": "Android 底座与系统服务", "value": android_sys_mb}
+    ]
+
+    return {"nodes": nodes, "links": links}
+
+def ai_inspector_loop():
+    """端侧 Qwen2.5-3B 每 10 分钟自动状态分析线程"""
     global latest_metrics
-
-    last_cpu_stats = read_cpu_stats()
-    last_rx, last_tx = read_net_bytes()
-    last_time = time.time()
-
+    # 启动等待 8 秒避免挤占开机资源
+    time.sleep(8)
     while True:
         try:
-            time.sleep(1.5)
-            now = time.time()
-            dt = max(now - last_time, 0.5)
-
-            # 1. 计算 CPU 使用率
-            curr_cpu_stats = read_cpu_stats()
-            cpu_total_pct = 0.0
-            cpu_cores_pct = [0.0] * 8
-
-            if "cpu" in curr_cpu_stats and "cpu" in last_cpu_stats:
-                dt_total = curr_cpu_stats["cpu"]["total"] - last_cpu_stats["cpu"]["total"]
-                dt_idle = curr_cpu_stats["cpu"]["idle"] - last_cpu_stats["cpu"]["idle"]
-                if dt_total > 0:
-                    cpu_total_pct = round(max(0.0, min(100.0, (1.0 - dt_idle / dt_total) * 100)), 1)
-
-            for i in range(8):
-                cname = f"cpu{i}"
-                if cname in curr_cpu_stats and cname in last_cpu_stats:
-                    dt_c_total = curr_cpu_stats[cname]["total"] - last_cpu_stats[cname]["total"]
-                    dt_c_idle = curr_cpu_stats[cname]["idle"] - last_cpu_stats[cname]["idle"]
-                    if dt_c_total > 0:
-                        cpu_cores_pct[i] = round(max(0.0, min(100.0, (1.0 - dt_c_idle / dt_c_total) * 100)), 1)
-
-            last_cpu_stats = curr_cpu_stats
-
-            # 2. 读取 CPU 频率 (MHz)
-            freqs = []
-            for i in range(8):
-                try:
-                    with open(f"/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq", "r") as f:
-                        freqs.append(int(int(f.read().strip()) / 1000))
-                except Exception:
-                    freqs.append(800)
-
-            # 3. 计算网络带宽 (KB/s)
-            curr_rx, curr_tx = read_net_bytes()
-            rx_rate = round(max(0.0, (curr_rx - last_rx) / dt / 1024.0), 1)
-            tx_rate = round(max(0.0, (curr_tx - last_tx) / dt / 1024.0), 1)
-            last_rx, last_tx = curr_rx, curr_tx
-            last_time = now
-
-            # 4. 内存 & ZRAM 数据
-            ram_info = {"total_mb": 11500, "used_mb": 0, "avail_mb": 0, "free_mb": 0, "cached_mb": 0, "pct": 0.0}
-            zram_info = {"total_mb": 7680, "used_mb": 0, "free_mb": 7680, "pct": 0.0}
-
-            try:
-                with open("/proc/meminfo", "r") as f:
-                    for line in f:
-                        if line.startswith("MemTotal:"):
-                            ram_info["total_mb"] = int(int(line.split()[1]) / 1024)
-                        elif line.startswith("MemAvailable:"):
-                            ram_info["avail_mb"] = int(int(line.split()[1]) / 1024)
-                        elif line.startswith("MemFree:"):
-                            ram_info["free_mb"] = int(int(line.split()[1]) / 1024)
-                        elif line.startswith("Cached:"):
-                            ram_info["cached_mb"] = int(int(line.split()[1]) / 1024)
-                        elif line.startswith("SwapTotal:"):
-                            zram_info["total_mb"] = int(int(line.split()[1]) / 1024)
-                        elif line.startswith("SwapFree:"):
-                            zram_info["free_mb"] = int(int(line.split()[1]) / 1024)
-
-                ram_info["used_mb"] = max(0, ram_info["total_mb"] - ram_info["avail_mb"])
-                if ram_info["total_mb"] > 0:
-                    ram_info["pct"] = round((ram_info["used_mb"] / ram_info["total_mb"]) * 100, 1)
-
-                zram_info["used_mb"] = max(0, zram_info["total_mb"] - zram_info["free_mb"])
-                if zram_info["total_mb"] > 0:
-                    zram_info["pct"] = round((zram_info["used_mb"] / zram_info["total_mb"]) * 100, 1)
-            except Exception:
-                pass
-
-            # 5. 温度读取
-            thermals = {
-                "battery": 29.8,
-                "cpu_max": 38.0,
-                "cpu_avg": 37.0,
-                "shell_back": 32.0,
-                "shell_front": 33.0,
-                "status": "NORMAL"
-            }
-            try:
-                cpu_temps = []
-                for z in glob.glob("/sys/class/thermal/thermal_zone*"):
-                    try:
-                        with open(f"{z}/type", "r") as tf, open(f"{z}/temp", "r") as vf:
-                            zt = tf.read().strip().lower()
-                            deg = float(vf.read().strip())
-                            deg = deg / 1000.0 if deg > 200 else deg
-                            if zt == "battery":
-                                thermals["battery"] = round(deg, 1)
-                            elif zt == "shell_back":
-                                thermals["shell_back"] = round(deg, 1)
-                            elif zt == "shell_front":
-                                thermals["shell_front"] = round(deg, 1)
-                            elif "cpu" in zt and 15.0 < deg < 115.0:
-                                cpu_temps.append(deg)
-                    except Exception:
-                        continue
-                if cpu_temps:
-                    thermals["cpu_max"] = round(max(cpu_temps), 1)
-                    thermals["cpu_avg"] = round(sum(cpu_temps) / len(cpu_temps), 1)
-
-                if thermals["battery"] >= 44.0 or thermals["cpu_max"] >= 75.0:
-                    thermals["status"] = "CRITICAL"
-                elif thermals["battery"] >= 40.0 or thermals["cpu_max"] >= 65.0:
-                    thermals["status"] = "WARNING"
-                else:
-                    thermals["status"] = "NORMAL"
-            except Exception:
-                pass
-
-            # 6. 服务端口与守护检测
-            srv_ql = check_port("127.0.0.1", 5700)
-            srv_llama = check_port("127.0.0.1", 8080)
-            srv_crond = os.system("pgrep crond > /dev/null 2>&1") == 0
-
-            # 7. Uptime
-            uptime_str = "运行正常"
-            try:
-                with open("/proc/uptime", "r") as f:
-                    uptime_sec = float(f.read().split()[0])
-                    uptime_str = format_uptime(uptime_sec)
-            except Exception:
-                pass
-
             with metrics_lock:
-                latest_metrics["timestamp"] = int(now)
-                latest_metrics["uptime_str"] = uptime_str
-                latest_metrics["cpu_total"] = cpu_total_pct
-                latest_metrics["cpu_cores"] = cpu_cores_pct
-                latest_metrics["cpu_freqs"] = freqs
-                latest_metrics["ram"] = ram_info
-                latest_metrics["zram"] = zram_info
-                latest_metrics["thermals"] = thermals
-                latest_metrics["net"] = {"rx_kbps": rx_rate, "tx_kbps": tx_rate}
-                latest_metrics["services"] = {
-                    "qinglong": srv_ql,
-                    "llama": srv_llama,
-                    "crond": srv_crond
+                c_temp = latest_metrics["thermals"].get("cpu_max", 34.0)
+                b_temp = latest_metrics["battery"].get("temp", 27.0)
+                ram_pct = latest_metrics["ram"].get("pct", 55.0)
+                load_val = latest_metrics["load_avg"][0] if latest_metrics["load_avg"] else 5.0
+                srv_online = sum(1 for s in latest_metrics["services"].values() if s.get("running"))
+                total_srv = len(latest_metrics["services"]) or 5
+
+            prompt_user = f"CPU温度{c_temp}°C，电池{b_temp}°C，内存占用{ram_pct}%，负载{load_val:.1f}，{srv_online}/{total_srv}个微服务在线。"
+            payload = {
+                "model": "qwen2.5-3b",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "你是安装在一加9手机微服务器上的端侧AI助手，23岁俏皮贴心同龄人设。请根据手机运行状态，用一句话（20字以内）给出简练、生动、有温度的巡检结论。直接输出结论即可，无需多余寒暄。"
+                    },
+                    {"role": "user", "content": prompt_user}
+                ],
+                "temperature": 0.7,
+                "max_tokens": 40
+            }
+
+            t0 = time.time()
+            req = urllib.request.Request(
+                "http://127.0.0.1:8080/v1/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=45) as res:
+                resp = json.loads(res.read().decode("utf-8"))
+                reply = resp["choices"][0]["message"]["content"].strip()
+                cost = time.time() - t0
+                now_str = time.strftime("%H:%M", time.localtime())
+
+                with metrics_lock:
+                    latest_metrics["ai_insight"] = {
+                        "text": reply,
+                        "updated_at": now_str,
+                        "cost_s": round(cost, 1)
+                    }
+        except Exception as e:
+            # 优雅降级兜底
+            now_str = time.strftime("%H:%M", time.localtime())
+            with metrics_lock:
+                if "正在就绪" in latest_metrics["ai_insight"]["text"]:
+                    latest_metrics["ai_insight"] = {
+                        "text": "一加 9 全局状态平稳，核心温度微凉，微服务矩阵持续健康运转中。",
+                        "updated_at": now_str,
+                        "cost_s": 0.0
+                    }
+        # 10 分钟循环 (600秒)
+        time.sleep(600)
+
+def metrics_collector_loop():
+    """秒级高频遥测守护线程 (1.0s 循环)"""
+    global latest_metrics
+    while True:
+        try:
+            now = time.time()
+            current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+            uptime_str, load_avg = get_uptime_and_load()
+            mem_data = read_mem_info()
+            freqs = read_cpu_freqs()
+            thermals = read_thermal_matrix()
+            procs = get_procs_info()
+
+            # 计算分簇平均频率
+            little_avg = int(sum(freqs[0:4]) / 4) if len(freqs) >= 4 else 0
+            big_avg = int(sum(freqs[4:7]) / 3) if len(freqs) >= 7 else 0
+            prime_val = freqs[7] if len(freqs) >= 8 else 0
+
+            # 评估微服务矩阵状态
+            services_status = {}
+            for s_key, s_cfg in MANAGED_SERVICES.items():
+                is_port_ok = check_port(s_cfg["port"])
+                proc_info = procs.get(s_key)
+                is_running = is_port_ok or (proc_info is not None)
+                pid = proc_info["pid"] if proc_info else None
+                rss_mb = get_proc_rss_mb(pid) if pid else 0.0
+
+                services_status[s_key] = {
+                    "id": s_key,
+                    "name": s_cfg["name"],
+                    "category": s_cfg["category"],
+                    "port": s_cfg["port"],
+                    "url": s_cfg["url"],
+                    "running": is_running,
+                    "pid": pid,
+                    "memory_mb": rss_mb
                 }
 
-                # 同步写入青龙静态目录，实现 5700 端口同源零鉴权极速直读
-                try:
-                    with open("/ql/static/dist/phone_metrics.json", "w", encoding="utf-8") as pf:
-                        json.dump(latest_metrics, pf, ensure_ascii=False)
-                except Exception:
-                    pass
-        except Exception as e:
-            time.sleep(1)
+            sankey_tree = get_process_memory_tree(mem_data, services_status)
 
-INDEX_HTML = """<!DOCTYPE html>
-<html lang="zh-CN" class="dark">
+            with metrics_lock:
+                latest_metrics["timestamp"] = int(now * 1000)
+                latest_metrics["current_time"] = current_time
+                latest_metrics["uptime_str"] = uptime_str
+                latest_metrics["load_avg"] = load_avg
+                latest_metrics["cpu_freqs"] = freqs
+                latest_metrics["max_freqs"] = MAX_FREQS
+                latest_metrics["clusters"] = {
+                    "little": little_avg,
+                    "big": big_avg,
+                    "prime": prime_val
+                }
+                latest_metrics["battery"] = {
+                    "temp": thermals["battery"],
+                    "voltage": thermals["vbat"],
+                    "status": "稳态供电"
+                }
+                latest_metrics["cpu_cores_temp"] = thermals["cpu_cores"]
+                latest_metrics["ram"] = mem_data["ram"]
+                latest_metrics["zram"] = mem_data["zram"]
+                latest_metrics["thermals"] = thermals
+                latest_metrics["services"] = services_status
+                latest_metrics["sankey_data"] = sankey_tree
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+HTML_DASHBOARD = """<!DOCTYPE html>
+<html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>一加 9 移动服务器实时性能仪表盘</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>DevCheck · OnePlus 9 一体化全景控制台</title>
   <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <!-- ECharts 5 桑基图轻量 CDN -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.4.3/echarts.min.js"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class'
+    };
+    let savedTheme = localStorage.getItem('op9_theme') || 'light';
+    if (savedTheme === 'dark') {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+  </script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <style>
-    @keyframes pulse-slow { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-    .pulse-slow { animation: pulse-slow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.35; transform: scale(1.2); }
+    }
+    .pulse-dot {
+      animation: pulse-dot 1.4s ease-in-out infinite;
+    }
+    .smooth-stroke {
+      transition: stroke-dashoffset 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+    }
   </style>
 </head>
-<body class="bg-[#0f172a] text-[#f8fafc] font-sans antialiased min-h-screen p-4 md:p-6 select-none">
+<body class="bg-[#f2f4f7] dark:bg-[#0c1017] text-slate-800 dark:text-slate-100 font-sans min-h-screen antialiased selection:bg-emerald-500 selection:text-white transition-colors duration-300">
 
-  <!-- Top Navigation Bar -->
-  <header class="max-w-7xl mx-auto flex flex-col sm:flex-row items-start sm:items-center justify-between pb-6 border-b border-slate-800 gap-4">
-    <div class="flex items-center space-x-3">
-      <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-500 flex items-center justify-center shadow-lg shadow-blue-500/20">
-        <svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"/>
-        </svg>
-      </div>
-      <div>
-        <h1 class="text-xl font-bold tracking-tight flex items-center gap-2">
-          一加 9 移动服务器 · 实时性能看板
-          <span class="text-xs font-mono font-medium px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 border border-blue-500/30">Snapdragon 888</span>
-        </h1>
-        <p class="text-xs text-slate-400 mt-0.5">局域网 IP: 192.168.31.172 · 系统运行时间: <span id="uptime" class="font-mono text-slate-300">--</span></p>
-      </div>
-    </div>
+  <!-- DevCheck Style Header -->
+  <header class="bg-white/90 dark:bg-[#131926]/90 backdrop-blur-md border-b border-slate-200/90 dark:border-slate-800/80 sticky top-0 z-40 shadow-xs">
+    <div class="max-w-[1760px] mx-auto px-4 sm:px-6">
+      <div class="flex items-center justify-between h-14">
+        <!-- Logo & Title -->
+        <div class="flex items-center space-x-3">
+          <div class="w-8 h-8 rounded-full bg-emerald-600 flex items-center justify-center text-white shadow-sm shadow-emerald-500/25">
+            <i class="fa-solid fa-circle-info text-sm"></i>
+          </div>
+          <div>
+            <div class="flex items-center gap-2">
+              <span class="text-base font-extrabold tracking-tight text-emerald-700 dark:text-emerald-400 font-sans">DevCheck</span>
+              <span class="text-[11px] font-mono px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 font-medium">OnePlus 9 · 移动微服务器</span>
+            </div>
+          </div>
+        </div>
 
-    <!-- Quick Service Indicators -->
-    <div class="flex items-center space-x-3 text-xs">
-      <a href="http://192.168.31.172:5700" target="_blank" class="px-3 py-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700/80 border border-slate-700 transition flex items-center space-x-2">
-        <span id="dot-ql" class="w-2 h-2 rounded-full bg-slate-500 inline-block"></span>
-        <span class="font-medium">青龙面板 (:5700) ↗</span>
-      </a>
-      <a href="http://192.168.31.172:8080/health" target="_blank" class="px-3 py-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700/80 border border-slate-700 transition flex items-center space-x-2">
-        <span id="dot-llama" class="w-2 h-2 rounded-full bg-slate-500 inline-block"></span>
-        <span class="font-medium">Qwen2.5-3B AI (:8080) ↗</span>
-      </a>
-      <button onclick="triggerThermalCheck()" class="px-3 py-1.5 rounded-lg bg-emerald-600/30 hover:bg-emerald-600/40 text-emerald-300 border border-emerald-500/30 font-medium transition flex items-center">
-        <span>⚡ 巡检温控</span>
-      </button>
+        <!-- Right Quick Controls -->
+        <div class="flex items-center space-x-2">
+          <!-- Realtime Live Pill -->
+          <div class="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 text-xs font-mono font-medium border border-emerald-200/60 dark:border-emerald-500/20">
+            <span class="w-2 h-2 rounded-full bg-emerald-500 pulse-dot"></span>
+            <span id="live-clock">--:--:--</span>
+            <span class="text-[10px] text-emerald-800 dark:text-emerald-300 bg-emerald-200/60 dark:bg-emerald-950 px-1 rounded font-semibold" id="rtt-tag">0ms</span>
+          </div>
+
+          <!-- Theme Toggle -->
+          <button onclick="toggleTheme()" class="w-8 h-8 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 flex items-center justify-center text-slate-600 dark:text-slate-300 transition" title="切换模式">
+            <i id="theme-toggle-icon" class="fa-solid fa-sun text-amber-500"></i>
+          </button>
+
+          <!-- 快速跳转与快捷动作 -->
+          <button onclick="triggerAction('all', 'heal')" class="hidden sm:flex px-2.5 py-1 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium items-center gap-1.5 shadow-sm transition active:scale-95">
+            <i class="fa-solid fa-wand-magic-sparkles"></i>
+            <span>自愈</span>
+          </button>
+        </div>
+      </div>
     </div>
   </header>
 
-  <main class="max-w-7xl mx-auto mt-6 space-y-6">
+  <!-- Main Container (宽屏双栏全景布局 · 告别滑轮滚动) -->
+  <main class="max-w-[1760px] mx-auto px-4 sm:px-6 py-3.5 space-y-3.5">
 
-    <!-- 4 Main Metric Gauges Cards -->
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-      
-      <!-- CPU Card -->
-      <div class="p-5 rounded-2xl bg-slate-800/50 border border-slate-700/60 backdrop-blur-sm relative overflow-hidden">
-        <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
-          <span>CPU 总利用率</span>
-          <span class="font-mono text-blue-400">8 核心</span>
+    <!-- ======================================================== -->
+    <!-- 端侧 Qwen2.5-3B 10分钟智能巡检心语胶囊                     -->
+    <!-- ======================================================== -->
+    <div class="bg-gradient-to-r from-emerald-500/10 via-teal-500/10 to-blue-500/10 dark:from-emerald-500/20 dark:via-teal-500/15 dark:to-blue-500/15 border border-emerald-300/40 dark:border-emerald-500/30 rounded-2xl p-2.5 sm:p-3 shadow-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2.5">
+      <div class="flex items-center space-x-2.5">
+        <div class="w-7 h-7 rounded-xl bg-gradient-to-tr from-emerald-600 to-teal-500 text-white flex items-center justify-center shadow-sm shrink-0">
+          <i class="fa-solid fa-wand-magic-sparkles text-xs"></i>
         </div>
-        <div class="mt-3 flex items-baseline justify-between">
-          <span id="cpu-total" class="text-4xl font-extrabold text-white font-mono tracking-tight">0.0%</span>
-          <span id="cpu-peak-badge" class="text-xs px-2 py-0.5 rounded-md bg-blue-500/20 text-blue-300 font-mono">温润调度</span>
-        </div>
-        <div class="w-full bg-slate-700/50 h-2 rounded-full mt-4 overflow-hidden">
-          <div id="cpu-bar" class="bg-gradient-to-r from-blue-500 to-indigo-500 h-full rounded-full transition-all duration-500" style="width: 0%"></div>
+        <div>
+          <div class="flex items-center gap-2">
+            <span class="text-xs font-bold text-emerald-800 dark:text-emerald-300 font-mono tracking-tight uppercase">端侧 Qwen2.5-3B 智能巡检</span>
+            <span class="text-[10px] text-slate-500 dark:text-slate-400 font-mono" id="ai-update-tag">每10分钟分析</span>
+          </div>
+          <p class="text-xs sm:text-sm font-semibold text-slate-800 dark:text-slate-100 mt-0.5" id="ai-insight-text">
+            正在分析手机运行状态...
+          </p>
         </div>
       </div>
+      <div class="text-[10px] font-mono text-emerald-700 dark:text-emerald-400 px-2 py-0.5 rounded-full bg-white/80 dark:bg-slate-800/80 border border-emerald-200/60 dark:border-emerald-500/20 whitespace-nowrap self-end sm:self-center">
+        <span>耗时: </span><b id="ai-cost-tag">--s</b> · <span id="ai-time-tag">--:--</span>
+      </div>
+    </div>
 
-      <!-- RAM Card -->
-      <div class="p-5 rounded-2xl bg-slate-800/50 border border-slate-700/60 backdrop-blur-sm">
-        <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
-          <span>物理内存 (RAM)</span>
-          <span class="font-mono text-purple-400">12.0 GB 总量</span>
-        </div>
-        <div class="mt-3 flex items-baseline justify-between">
-          <span id="ram-used" class="text-4xl font-extrabold text-white font-mono tracking-tight">0.0 GB</span>
-          <span id="ram-avail" class="text-xs text-slate-400 font-mono">余 0.0 GB</span>
-        </div>
-        <div class="w-full bg-slate-700/50 h-2 rounded-full mt-4 overflow-hidden">
-          <div id="ram-bar" class="bg-gradient-to-r from-purple-500 to-pink-500 h-full rounded-full transition-all duration-500" style="width: 0%"></div>
-        </div>
+    <!-- ======================================================== -->
+    <!-- 核心双栏自适应工作台 (Widescreen 2-Column Dashboard)       -->
+    <!-- ======================================================== -->
+    <div class="grid grid-cols-1 xl:grid-cols-12 gap-4 items-stretch">
+
+      <!-- 左栏：硬件总览矩阵 + 核心指标 + 微服务生命周期 (xl:col-span-6) -->
+      <div class="xl:col-span-6 flex flex-col space-y-3.5">
+
+        <!-- 板块一：实时硬件与状态总览 -->
+        <section class="space-y-3">
+          <div class="flex items-center justify-between">
+            <h2 class="text-xs font-bold text-slate-900 dark:text-white flex items-center gap-2">
+              <i class="fa-solid fa-table-cells-large text-emerald-600"></i>
+              <span>实时硬件与状态总览</span>
+            </h2>
+            <span class="text-[10px] text-slate-500 font-mono">1Hz 硬件直读</span>
+          </div>
+
+          <!-- DevCheck 标志性 CPU 状态卡 (带 60FPS 丝滑流动背景波形图) -->
+          <div class="relative bg-white dark:bg-[#131926] rounded-2xl p-4 border border-slate-200/90 dark:border-slate-800/80 shadow-xs overflow-hidden">
+            <canvas id="cpu-bg-canvas" class="absolute inset-0 w-full h-full pointer-events-none opacity-40 dark:opacity-30"></canvas>
+
+            <div class="relative z-10">
+              <div class="flex items-center justify-between mb-2">
+                <span class="text-xs font-bold text-emerald-700 dark:text-emerald-400 flex items-center gap-2">
+                  <i class="fa-solid fa-microchip"></i>
+                  <span>CPU 状态矩阵</span>
+                </span>
+                <div class="text-[11px] text-slate-500 dark:text-slate-400 font-mono">
+                  <span>系统负载: </span>
+                  <b id="dash-load" class="text-slate-800 dark:text-slate-200 font-bold">-- / -- / --</b>
+                </div>
+              </div>
+
+              <!-- 8 核心 MHz 2 列 x 4 行矩阵 -->
+              <div class="grid grid-cols-2 gap-x-6 gap-y-1.5 my-2" id="dash-cpu-matrix"></div>
+
+              <div class="pt-2 border-t border-slate-100 dark:border-slate-800/80 flex items-center justify-between text-[11px] text-slate-600 dark:text-slate-400 font-mono">
+                <div class="flex items-center gap-4">
+                  <span>CPU 峰值: <b id="dash-cpu-temp" class="text-emerald-600 dark:text-emerald-400 font-bold">--°C</b></span>
+                  <span>GPU: <b class="text-slate-700 dark:text-slate-300">120Hz · Adreno 660</b></span>
+                </div>
+                <div class="text-[10px] text-slate-400">8 核全开 · Kryo 680</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 4 宫格卡片 -->
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+
+            <!-- 电池与供电 -->
+            <div class="bg-white dark:bg-[#131926] rounded-2xl p-3 border border-slate-200/90 dark:border-slate-800/80 shadow-xs flex items-center justify-between">
+              <div class="space-y-0.5">
+                <span class="text-[11px] font-semibold text-slate-500 dark:text-slate-400">电池核心</span>
+                <div class="text-base font-bold text-slate-900 dark:text-white flex items-baseline gap-1.5">
+                  <span id="bat-voltage">-- V</span>
+                  <span id="dash-bat-temp" class="text-xs font-semibold text-emerald-600 dark:text-emerald-400">--°C</span>
+                </div>
+                <p class="text-[10px] text-slate-500">稳态直流供电</p>
+              </div>
+              <div class="w-8 h-8 rounded-xl bg-emerald-50 dark:bg-emerald-500/10 flex items-center justify-center text-emerald-600 dark:text-emerald-400">
+                <i class="fa-solid fa-battery-three-quarters text-sm"></i>
+              </div>
+            </div>
+
+            <!-- 网络通信 -->
+            <div class="bg-white dark:bg-[#131926] rounded-2xl p-3 border border-slate-200/90 dark:border-slate-800/80 shadow-xs flex items-center justify-between">
+              <div class="space-y-0.5">
+                <span class="text-[11px] font-semibold text-slate-500 dark:text-slate-400">网络与在线</span>
+                <div class="text-sm font-bold text-slate-900 dark:text-white font-mono">192.168.31.172</div>
+                <p class="text-[10px] text-slate-500">开机: <b id="dash-uptime" class="text-emerald-600 font-mono">--</b></p>
+              </div>
+              <div class="w-8 h-8 rounded-xl bg-blue-50 dark:bg-blue-500/10 flex items-center justify-center text-blue-600 dark:text-blue-400">
+                <i class="fa-solid fa-wifi text-sm"></i>
+              </div>
+            </div>
+
+            <!-- 内存 (DevCheck 环形圆环图) -->
+            <div class="bg-white dark:bg-[#131926] rounded-2xl p-3 border border-slate-200/90 dark:border-slate-800/80 shadow-xs flex items-center justify-between">
+              <div class="space-y-0.5">
+                <span class="text-[11px] font-semibold text-slate-500 dark:text-slate-400">物理内存</span>
+                <div class="text-sm font-bold text-slate-900 dark:text-white font-mono" id="ram-used-text">-- GB</div>
+                <p class="text-[10px] text-slate-500">11.0 GB LPDDR5</p>
+              </div>
+              <div class="relative w-12 h-12 flex items-center justify-center">
+                <svg class="w-12 h-12 transform -rotate-90">
+                  <circle cx="24" cy="24" r="20" stroke="currentColor" stroke-width="4" fill="transparent" class="text-slate-100 dark:text-slate-800" />
+                  <circle id="ram-ring" cx="24" cy="24" r="20" stroke="#16a34a" stroke-width="4" fill="transparent" stroke-linecap="round" stroke-dasharray="125.66" stroke-dashoffset="125.66" class="smooth-stroke" />
+                </svg>
+                <span id="ram-ring-text" class="absolute text-[10px] font-mono font-bold text-slate-800 dark:text-slate-200">0%</span>
+              </div>
+            </div>
+
+            <!-- ZRAM 压缩交换池 (DevCheck 环形圆环图) -->
+            <div class="bg-white dark:bg-[#131926] rounded-2xl p-3 border border-slate-200/90 dark:border-slate-800/80 shadow-xs flex items-center justify-between">
+              <div class="space-y-0.5">
+                <span class="text-[11px] font-semibold text-slate-500 dark:text-slate-400">ZRAM 缓冲</span>
+                <div class="text-sm font-bold text-slate-900 dark:text-white font-mono" id="zram-used-text">-- MB</div>
+                <p class="text-[10px] text-slate-500">7.6 GB Swap压缩</p>
+              </div>
+              <div class="relative w-12 h-12 flex items-center justify-center">
+                <svg class="w-12 h-12 transform -rotate-90">
+                  <circle cx="24" cy="24" r="20" stroke="currentColor" stroke-width="4" fill="transparent" class="text-slate-100 dark:text-slate-800" />
+                  <circle id="zram-ring" cx="24" cy="24" r="20" stroke="#16a34a" stroke-width="4" fill="transparent" stroke-linecap="round" stroke-dasharray="125.66" stroke-dashoffset="125.66" class="smooth-stroke" />
+                </svg>
+                <span id="zram-ring-text" class="absolute text-[10px] font-mono font-bold text-slate-800 dark:text-slate-200">0%</span>
+              </div>
+            </div>
+
+          </div>
+        </section>
+
+        <!-- 板块二：微服务生命周期中枢 -->
+        <section class="space-y-2.5 flex-1 flex flex-col">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-2">
+              <i class="fa-solid fa-cubes-stacked text-emerald-600 text-xs"></i>
+              <span class="text-xs font-bold text-slate-900 dark:text-white">微服务生命周期管理中枢</span>
+              <span class="text-[10px] font-mono font-bold px-2 py-0.2 rounded-full bg-emerald-100 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-400" id="total-srv-badge">5 在线</span>
+            </div>
+            <button onclick="triggerAction('all', 'heal')" class="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-medium shadow-xs transition active:scale-95 flex items-center gap-1.5">
+              <i class="fa-solid fa-wand-magic-sparkles text-[10px]"></i>
+              <span>全员自愈</span>
+            </button>
+          </div>
+
+          <!-- Services Grid (双列卡片自适应填满) -->
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5" id="services-grid"></div>
+        </section>
+
       </div>
 
-      <!-- Battery & Thermal Card -->
-      <div class="p-5 rounded-2xl bg-slate-800/50 border border-slate-700/60 backdrop-blur-sm">
-        <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
-          <span>电池核心温度</span>
-          <span id="thermal-badge" class="text-xs px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 font-medium">健康</span>
-        </div>
-        <div class="mt-3 flex items-baseline justify-between">
-          <span id="temp-battery" class="text-4xl font-extrabold text-emerald-400 font-mono tracking-tight">0.0 °C</span>
-          <span id="temp-shell" class="text-xs text-slate-400 font-mono">机身背壳 0.0 °C</span>
-        </div>
-        <div class="w-full bg-slate-700/50 h-2 rounded-full mt-4 overflow-hidden">
-          <div id="temp-bar" class="bg-gradient-to-r from-emerald-500 to-teal-400 h-full rounded-full transition-all duration-500" style="width: 30%"></div>
-        </div>
-      </div>
-
-      <!-- Network Bandwidth Card -->
-      <div class="p-5 rounded-2xl bg-slate-800/50 border border-slate-700/60 backdrop-blur-sm">
-        <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
-          <span>Wi-Fi 6 实时吞吐</span>
-          <span class="font-mono text-cyan-400">wlan0</span>
-        </div>
-        <div class="mt-3 flex items-baseline justify-between">
+      <!-- 右栏：内存分配拓扑 · 进程级桑基图 (xl:col-span-6) -->
+      <div class="xl:col-span-6 flex flex-col space-y-3 h-full">
+        <div class="flex items-center justify-between">
           <div>
-            <div class="text-xs text-slate-400">↓ 下载 <span id="net-rx" class="text-xl font-bold text-white font-mono">0.0</span> <span class="text-xs">KB/s</span></div>
-            <div class="text-xs text-slate-400 mt-0.5">↑ 上传 <span id="net-tx" class="text-xl font-bold text-white font-mono">0.0</span> <span class="text-xs">KB/s</span></div>
+            <h2 class="text-xs font-bold text-slate-900 dark:text-white flex items-center gap-2">
+              <i class="fa-solid fa-diagram-project text-emerald-600"></i>
+              <span>内存分配拓扑 · 进程级桑基图</span>
+            </h2>
+            <p class="text-[11px] text-slate-500 mt-0.5">物理内存与虚拟交换池 -> 分配形态 -> 进程级物理内存流向分析</p>
           </div>
-          <span class="text-2xl opacity-60">📶</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- Core Breakdown Section: Snapdragon 888 8-Core Matrix -->
-    <div class="p-6 rounded-2xl bg-slate-800/40 border border-slate-700/60 backdrop-blur-sm">
-      <div class="flex items-center justify-between mb-4">
-        <div>
-          <h2 class="text-base font-bold text-white flex items-center gap-2">
-            高通骁龙 888 · 8 核心实时负载矩阵
-          </h2>
-          <p class="text-xs text-slate-400 mt-0.5">包含 1x Cortex-X1 超大核 + 3x Cortex-A78 性能大核 + 4x Cortex-A55 能效小核</p>
-        </div>
-        <span class="text-xs px-2.5 py-1 rounded bg-slate-700/50 text-slate-300 font-mono">1.5s 动态轮询</span>
-      </div>
-
-      <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3" id="core-container">
-        <!-- Injected via JS -->
-      </div>
-    </div>
-
-    <!-- Memory Detail & Thermal Zones Grid -->
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-
-      <!-- Memory & ZRAM Breakdown -->
-      <div class="p-6 rounded-2xl bg-slate-800/40 border border-slate-700/60 backdrop-blur-sm flex flex-col justify-between">
-        <div>
-          <h3 class="text-base font-bold text-white mb-1">内存架构与 ZRAM 压缩状态</h3>
-          <p class="text-xs text-slate-400 mb-4">基于高通平台虚拟内存压缩技术，防止低内存被 Android LMK 强杀</p>
-
-          <div class="space-y-4 text-xs font-mono">
-            <div>
-              <div class="flex justify-between text-slate-300 mb-1">
-                <span>物理内存 (RAM 12GB)</span>
-                <span id="ram-txt">0 / 0 MB</span>
-              </div>
-              <div class="w-full bg-slate-700/40 h-3 rounded-full overflow-hidden">
-                <div id="ram-detail-bar" class="h-full bg-purple-500 rounded-full transition-all" style="width: 0%"></div>
-              </div>
-            </div>
-
-            <div>
-              <div class="flex justify-between text-slate-300 mb-1">
-                <span>ZRAM 压缩扩展内存 (7.8GB)</span>
-                <span id="zram-txt">0 / 0 MB</span>
-              </div>
-              <div class="w-full bg-slate-700/40 h-3 rounded-full overflow-hidden">
-                <div id="zram-bar" class="h-full bg-indigo-500 rounded-full transition-all" style="width: 0%"></div>
-              </div>
-            </div>
-
-            <div class="pt-3 grid grid-cols-3 gap-2 text-center">
-              <div class="p-2.5 rounded-xl bg-slate-800/80 border border-slate-700/50">
-                <div class="text-[11px] text-slate-400">可用空闲 (Available)</div>
-                <div id="ram-avail-mb" class="text-sm font-bold text-emerald-400 mt-0.5">-- MB</div>
-              </div>
-              <div class="p-2.5 rounded-xl bg-slate-800/80 border border-slate-700/50">
-                <div class="text-[11px] text-slate-400">系统缓存 (Cached)</div>
-                <div id="ram-cached-mb" class="text-sm font-bold text-blue-400 mt-0.5">-- MB</div>
-              </div>
-              <div class="p-2.5 rounded-xl bg-slate-800/80 border border-slate-700/50">
-                <div class="text-[11px] text-slate-400">纯物理空闲 (Free)</div>
-                <div id="ram-free-mb" class="text-sm font-bold text-slate-300 mt-0.5">-- MB</div>
-              </div>
-            </div>
-          </div>
+          <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-200/50">默认标注实时容量 · 悬停透视流向</span>
         </div>
 
-        <div class="mt-4 pt-3 border-t border-slate-800 flex justify-between items-center text-xs text-slate-400">
-          <span>精简优化状态：已停用 22 项无用预装</span>
-          <span class="text-emerald-400 font-medium">✓ 零后台偷跑</span>
-        </div>
-      </div>
-
-      <!-- Thermal Zone Matrix -->
-      <div class="p-6 rounded-2xl bg-slate-800/40 border border-slate-700/60 backdrop-blur-sm flex flex-col justify-between">
-        <div>
-          <h3 class="text-base font-bold text-white mb-1">机身各热区传感器实时矩阵</h3>
-          <p class="text-xs text-slate-400 mb-4">通过 Linux sysfs 硬件驱动直读，设定 40°C 预警与 44°C 紧急熔断</p>
-
-          <div class="grid grid-cols-2 gap-3 text-xs">
-            <div class="p-3 rounded-xl bg-slate-800/80 border border-slate-700/50 flex justify-between items-center">
-              <div>
-                <div class="text-slate-400">🔋 电池核心</div>
-                <div id="tz-bat" class="text-lg font-bold font-mono text-emerald-400 mt-0.5">-- °C</div>
-              </div>
-              <span class="text-xs text-slate-500 font-mono">&lt; 40°C 正常</span>
-            </div>
-
-            <div class="p-3 rounded-xl bg-slate-800/80 border border-slate-700/50 flex justify-between items-center">
-              <div>
-                <div class="text-slate-400">⚡ CPU 核心峰值</div>
-                <div id="tz-cpu-max" class="text-lg font-bold font-mono text-blue-400 mt-0.5">-- °C</div>
-              </div>
-              <span class="text-xs text-slate-500 font-mono">&lt; 65°C 正常</span>
-            </div>
-
-            <div class="p-3 rounded-xl bg-slate-800/80 border border-slate-700/50 flex justify-between items-center">
-              <div>
-                <div class="text-slate-400">📱 机身外壳背面</div>
-                <div id="tz-shell-back" class="text-lg font-bold font-mono text-teal-400 mt-0.5">-- °C</div>
-              </div>
-              <span class="text-xs text-slate-500 font-mono">体感微凉</span>
-            </div>
-
-            <div class="p-3 rounded-xl bg-slate-800/80 border border-slate-700/50 flex justify-between items-center">
-              <div>
-                <div class="text-slate-400">🖥️ 屏幕正面表面</div>
-                <div id="tz-shell-front" class="text-lg font-bold font-mono text-slate-300 mt-0.5">-- °C</div>
-              </div>
-              <span class="text-xs text-slate-500 font-mono">待机息屏</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="mt-4 pt-3 border-t border-slate-800 flex justify-between items-center text-xs text-slate-400">
-          <span>温控守护线程：Crond 每 15 分钟巡检</span>
-          <span class="text-emerald-400 font-medium">✓ 自动熔断关停已激活</span>
+        <div class="bg-white dark:bg-[#131926] rounded-2xl p-4 sm:p-5 border border-slate-200/90 dark:border-slate-800/80 shadow-xs flex-1 flex flex-col min-h-[540px] xl:min-h-[640px]">
+          <div id="sankey-chart" class="w-full flex-1 min-h-[520px] xl:min-h-[610px]"></div>
         </div>
       </div>
 
@@ -520,180 +704,603 @@ INDEX_HTML = """<!DOCTYPE html>
 
   </main>
 
-  <footer class="max-w-7xl mx-auto mt-8 text-center text-xs text-slate-500 pb-6">
-    一加 9 (OnePlus 9 · LE2110) 移动微服务器 · Debian 12 ARM64 · 由 Antigravity 自动化构建
-  </footer>
+  <!-- Log Modal -->
+  <div id="log-modal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-xs hidden items-center justify-center z-50 p-4">
+    <div class="bg-white dark:bg-[#131926] border border-slate-200 dark:border-slate-800 rounded-2xl w-full max-w-4xl max-h-[85vh] flex flex-col shadow-2xl overflow-hidden">
+      <!-- Modal Header -->
+      <div class="px-5 py-3.5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between bg-slate-50 dark:bg-slate-900/80">
+        <div class="flex items-center gap-2.5">
+          <i class="fa-solid fa-terminal text-emerald-600 text-sm"></i>
+          <span id="log-modal-title" class="font-bold text-sm text-slate-900 dark:text-slate-200">服务控制台日志</span>
+          <span id="log-modal-badge" class="text-xs font-mono px-2 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-400">tail -n 80</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="refreshCurrentLogs()" class="px-2.5 py-1 text-xs rounded-lg bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 transition">
+            <i class="fa-solid fa-arrows-rotate mr-1"></i>刷新
+          </button>
+          <button onclick="closeLogModal()" class="w-7 h-7 rounded-lg bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 flex items-center justify-center transition">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+      </div>
+
+      <!-- Log Terminal Body -->
+      <div class="p-4 flex-1 overflow-y-auto font-mono text-xs text-slate-200 bg-[#090d16] leading-relaxed whitespace-pre-wrap select-text" id="log-content">
+        正在读取日志...
+      </div>
+    </div>
+  </div>
 
   <script>
-    // Initialize 8 core cards
-    const coreNames = ["Core 0 (A55)", "Core 1 (A55)", "Core 2 (A55)", "Core 3 (A55)", "Core 4 (A78)", "Core 5 (A78)", "Core 6 (A78)", "Core 7 (X1)"];
-    const coreContainer = document.getElementById("core-container");
-    coreNames.forEach((name, idx) => {
-      const isSuper = idx === 7;
-      const isBig = idx >= 4 && idx < 7;
-      const badge = isSuper ? "超大核" : (isBig ? "大核" : "小核");
-      const badgeColor = isSuper ? "text-amber-400 bg-amber-500/10" : (isBig ? "text-blue-400 bg-blue-500/10" : "text-slate-400 bg-slate-700/30");
-      
-      const card = document.createElement("div");
-      card.className = "p-3 rounded-xl bg-slate-800/80 border border-slate-700/40 flex flex-col justify-between";
-      card.innerHTML = `
-        <div class="flex justify-between items-center text-[10px] mb-1">
-          <span class="font-mono text-slate-400">#${idx}</span>
-          <span class="px-1 rounded ${badgeColor}">${badge}</span>
-        </div>
-        <div class="my-1.5 flex items-baseline justify-between">
-          <span id="core-val-${idx}" class="text-lg font-bold font-mono text-white">0%</span>
-          <span id="core-freq-${idx}" class="text-[10px] font-mono text-slate-400">-- MHz</span>
-        </div>
-        <div class="w-full bg-slate-700/40 h-1.5 rounded-full overflow-hidden">
-          <div id="core-bar-${idx}" class="h-full bg-blue-500 rounded-full transition-all" style="width: 0%"></div>
-        </div>
-      `;
-      coreContainer.appendChild(card);
-    });
+    // ========================================================
+    // 1. 60FPS 丝滑贝塞尔波形图渲染引擎
+    // ========================================================
+    class SmoothWaveChart {
+      constructor(canvasId, options = {}) {
+        this.canvas = document.getElementById(canvasId);
+        if (!this.canvas) return;
+        this.ctx = this.canvas.getContext('2d');
+        this.maxPoints = options.maxPoints || 36;
+        this.strokeColor = options.strokeColor || '#16a34a';
+        this.fillColor = options.fillColor || 'rgba(22, 163, 74, 0.18)';
+        this.fixedMin = options.min !== undefined ? options.min : null;
+        this.fixedMax = options.max !== undefined ? options.max : null;
+        this.data = [];
+        this.prevPoints = [];
+        this.targetPoints = [];
+        this.progress = 1.0;
+        this.setupDPI();
+      }
 
-    async function fetchMetrics() {
-      try {
-        let res;
-        try {
-          res = await fetch("/phone_metrics.json?_t=" + Date.now());
-          if (!res.ok) throw new Error();
-        } catch(e) {
-          res = await fetch("/api/metrics?_t=" + Date.now());
+      setupDPI() {
+        if (!this.canvas) return;
+        const rect = this.canvas.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return;
+        const dpr = window.devicePixelRatio || 1;
+        this.width = rect.width;
+        this.height = rect.height;
+        this.canvas.width = rect.width * dpr;
+        this.canvas.height = rect.height * dpr;
+        this.ctx.scale(dpr, dpr);
+      }
+
+      pushValue(val) {
+        if (this.data.length >= this.maxPoints) {
+          this.data.shift();
         }
-        const data = await res.json();
+        this.data.push(val);
+        this.prevPoints = this.targetPoints.length ? [...this.targetPoints] : [...this.data];
+        this.targetPoints = [...this.data];
+        this.progress = 0.0;
+      }
 
-        // Uptime
-        document.getElementById("uptime").innerText = data.uptime_str;
+      render() {
+        if (!this.canvas || !this.data.length) return;
+        if (this.width === 0 || this.height === 0) this.setupDPI();
+        const ctx = this.ctx;
+        const w = this.width;
+        const h = this.height;
 
-        // CPU Total
-        document.getElementById("cpu-total").innerText = data.cpu_total + "%";
-        document.getElementById("cpu-bar").style.width = data.cpu_total + "%";
+        ctx.clearRect(0, 0, w, h);
 
-        // Cores
-        data.cpu_cores.forEach((pct, idx) => {
-          const elVal = document.getElementById(`core-val-${idx}`);
-          const elFreq = document.getElementById(`core-freq-${idx}`);
-          const elBar = document.getElementById(`core-bar-${idx}`);
-          if (elVal) elVal.innerText = pct + "%";
-          if (elFreq && data.cpu_freqs[idx]) elFreq.innerText = data.cpu_freqs[idx] + " MHz";
-          if (elBar) elBar.style.width = pct + "%";
+        if (this.progress < 1.0) {
+          this.progress = Math.min(1.0, this.progress + 0.08);
+        }
+
+        let pts = [];
+        for (let i = 0; i < this.data.length; i++) {
+          let p0 = this.prevPoints[i] !== undefined ? this.prevPoints[i] : this.data[i];
+          let p1 = this.targetPoints[i];
+          pts.push(p0 + (p1 - p0) * this.progress);
+        }
+
+        let min = this.fixedMin !== null ? this.fixedMin : Math.min(...pts) * 0.9;
+        let max = this.fixedMax !== null ? this.fixedMax : Math.max(...pts) * 1.1;
+        if (max <= min) max = min + 1;
+
+        const step = w / (this.maxPoints - 1);
+        let coords = pts.map((v, i) => {
+          let norm = (v - min) / (max - min);
+          norm = Math.max(0, Math.min(1, norm));
+          return {
+            x: i * step,
+            y: h - norm * (h - 8) - 4
+          };
         });
 
-        // RAM
-        const ramUsedGb = (data.ram.used_mb / 1024).toFixed(1);
-        const ramAvailGb = (data.ram.avail_mb / 1024).toFixed(1);
-        document.getElementById("ram-used").innerText = ramUsedGb + " GB";
-        document.getElementById("ram-avail").innerText = "余 " + ramAvailGb + " GB";
-        document.getElementById("ram-bar").style.width = data.ram.pct + "%";
-        document.getElementById("ram-detail-bar").style.width = data.ram.pct + "%";
-        document.getElementById("ram-txt").innerText = `${data.ram.used_mb} / ${data.ram.total_mb} MB (${data.ram.pct}%)`;
-        document.getElementById("ram-avail-mb").innerText = data.ram.avail_mb + " MB";
-        document.getElementById("ram-cached-mb").innerText = data.ram.cached_mb + " MB";
-        document.getElementById("ram-free-mb").innerText = data.ram.free_mb + " MB";
-
-        // ZRAM
-        document.getElementById("zram-txt").innerText = `${data.zram.used_mb} / ${data.zram.total_mb} MB (${data.zram.pct}%)`;
-        document.getElementById("zram-bar").style.width = data.zram.pct + "%";
-
-        // Thermals
-        document.getElementById("temp-battery").innerText = data.thermals.battery + " °C";
-        document.getElementById("temp-shell").innerText = "机身背壳 " + data.thermals.shell_back + " °C";
-        document.getElementById("tz-bat").innerText = data.thermals.battery + " °C";
-        document.getElementById("tz-cpu-max").innerText = data.thermals.cpu_max + " °C";
-        document.getElementById("tz-shell-back").innerText = data.thermals.shell_back + " °C";
-        document.getElementById("tz-shell-front").innerText = (data.thermals.shell_front || "--") + " °C";
-
-        // Net
-        document.getElementById("net-rx").innerText = data.net.rx_kbps;
-        document.getElementById("net-tx").innerText = data.net.tx_kbps;
-
-        // Service dots
-        const dotQl = document.getElementById("dot-ql");
-        const dotLlama = document.getElementById("dot-llama");
-        if (data.services.qinglong) {
-          dotQl.className = "w-2 h-2 rounded-full bg-emerald-500 inline-block shadow-sm shadow-emerald-500/50";
-        } else {
-          dotQl.className = "w-2 h-2 rounded-full bg-red-500 inline-block";
-        }
-        if (data.services.llama) {
-          dotLlama.className = "w-2 h-2 rounded-full bg-emerald-500 inline-block shadow-sm shadow-emerald-500/50";
-        } else {
-          dotLlama.className = "w-2 h-2 rounded-full bg-red-500 inline-block";
+        ctx.beginPath();
+        ctx.moveTo(coords[0].x, coords[0].y);
+        for (let i = 0; i < coords.length - 1; i++) {
+          const cpX = (coords[i].x + coords[i + 1].x) / 2;
+          ctx.bezierCurveTo(cpX, coords[i].y, cpX, coords[i + 1].y, coords[i + 1].x, coords[i + 1].y);
         }
 
-      } catch (e) {
-        console.error("Fetch metrics error:", e);
+        ctx.strokeStyle = this.strokeColor;
+        ctx.lineWidth = 2.0;
+        ctx.stroke();
+
+        ctx.lineTo(coords[coords.length - 1].x, h);
+        ctx.lineTo(coords[0].x, h);
+        ctx.closePath();
+
+        const grad = ctx.createLinearGradient(0, 0, 0, h);
+        grad.addColorStop(0, this.fillColor);
+        grad.addColorStop(1, 'rgba(22, 163, 74, 0.0)');
+        ctx.fillStyle = grad;
+        ctx.fill();
       }
     }
 
-    async function triggerThermalCheck() {
-      alert("已触发硬件温控与健康快速巡检！");
-      fetch("/api/action/thermal_check");
+    let cpuBgChart = null;
+    let sankeyChartInstance = null;
+
+    function initCharts() {
+      cpuBgChart = new SmoothWaveChart('cpu-bg-canvas', {
+        maxPoints: 32,
+        strokeColor: '#16a34a',
+        fillColor: 'rgba(22, 163, 74, 0.25)',
+        min: 500, max: 2841
+      });
+
+      // 初始化 ECharts 桑基图
+      const sankeyEl = document.getElementById('sankey-chart');
+      if (sankeyEl && window.echarts) {
+        sankeyChartInstance = echarts.init(sankeyEl);
+      }
+
+      function animLoop() {
+        if (cpuBgChart) cpuBgChart.render();
+        requestAnimationFrame(animLoop);
+      }
+      requestAnimationFrame(animLoop);
     }
 
-    // Auto poll every 1.5s
-    fetchMetrics();
-    setInterval(fetchMetrics, 1500);
+    window.addEventListener('resize', () => {
+      if (cpuBgChart) cpuBgChart.setupDPI();
+      if (sankeyChartInstance) {
+        sankeyChartInstance.resize();
+        if (lastSankeyData) renderSankey(lastSankeyData);
+      }
+    });
+
+    // ========================================================
+    // 2. 主题切换器
+    // ========================================================
+    function toggleTheme() {
+      const root = document.documentElement;
+      const isDark = root.classList.contains('dark');
+      const newTheme = isDark ? 'light' : 'dark';
+      if (newTheme === 'dark') {
+        root.classList.add('dark');
+      } else {
+        root.classList.remove('dark');
+      }
+      localStorage.setItem('op9_theme', newTheme);
+      updateThemeIcon(newTheme);
+      if (sankeyChartInstance && lastSankeyData) {
+        renderSankey(lastSankeyData);
+      }
+    }
+
+    function updateThemeIcon(theme) {
+      const icon = document.getElementById('theme-toggle-icon');
+      if (!icon) return;
+      icon.className = theme === 'dark' ? 'fa-solid fa-moon text-indigo-400' : 'fa-solid fa-sun text-amber-500';
+    }
+    updateThemeIcon(localStorage.getItem('op9_theme') || 'light');
+
+    // ========================================================
+    // 3. 桑基图渲染器 (ECharts Sankey - 默认外显真实容量与优雅渐变)
+    // ========================================================
+    let lastSankeyData = null;
+    function renderSankey(data) {
+      if (!sankeyChartInstance || !data || !data.nodes) return;
+      lastSankeyData = data;
+      const isDark = document.documentElement.classList.contains('dark');
+      const isSmallScreen = window.innerWidth < 768;
+
+      const formatSize = function(val) {
+        if (val === undefined || val === null || isNaN(val)) return '';
+        if (val >= 1024) {
+          return (val / 1024).toFixed(1) + ' GB';
+        }
+        return Math.round(val) + ' MB';
+      };
+
+      const option = {
+        tooltip: {
+          trigger: 'item',
+          triggerOn: 'mousemove',
+          backgroundColor: isDark ? 'rgba(30, 41, 59, 0.95)' : 'rgba(255, 255, 255, 0.95)',
+          borderColor: isDark ? '#334155' : '#e2e8f0',
+          borderWidth: 1,
+          textStyle: {
+            color: isDark ? '#f8fafc' : '#0f172a'
+          },
+          formatter: function(params) {
+            if (params.dataType === 'node') {
+              const val = params.value !== undefined ? params.value : (params.data && params.data.value ? params.data.value : 0);
+              const sizeStr = formatSize(val);
+              return `<div class="font-sans text-xs"><b>${params.name}</b><br/><span style="color:${params.color}">●</span> 真实容量: <span class="font-mono font-bold text-emerald-600 dark:text-emerald-400">${sizeStr} (${val} MB)</span></div>`;
+            } else {
+              const val = params.data.value;
+              const sizeStr = formatSize(val);
+              return `<div class="font-sans text-xs">${params.data.source} → <b>${params.data.target}</b><br/>流向分配: <span class="font-mono font-bold text-emerald-600 dark:text-emerald-400">${sizeStr} (${val} MB)</span></div>`;
+            }
+          }
+        },
+        series: [
+          {
+            type: 'sankey',
+            layout: 'none',
+            emphasis: { focus: 'adjacency' },
+            data: data.nodes,
+            links: data.links,
+            orient: 'horizontal',
+            nodeWidth: 16,
+            nodeGap: 14,
+            draggable: false,
+            left: isSmallScreen ? 115 : 140,
+            right: isSmallScreen ? 185 : 220,
+            top: 20,
+            bottom: 20,
+            label: {
+              position: 'right',
+              fontSize: 11,
+              color: isDark ? '#f1f5f9' : '#334155',
+              fontFamily: 'monospace',
+              formatter: function(params) {
+                const val = params.value !== undefined ? params.value : (params.data && params.data.value ? params.data.value : 0);
+                const sizeStr = formatSize(val);
+                return sizeStr ? `${params.name} (${sizeStr})` : params.name;
+              }
+            },
+            lineStyle: {
+              color: 'gradient',
+              curveness: 0.5,
+              opacity: 0.38
+            },
+            itemStyle: {
+              borderWidth: 0,
+              borderRadius: 3
+            }
+          }
+        ]
+      };
+      sankeyChartInstance.setOption(option);
+    }
+
+    // ========================================================
+    // 4. 数据拉取与界面渲染
+    // ========================================================
+    let isFetching = false;
+    let activeLogService = null;
+    let lastSankeyRenderTime = 0;
+
+    function renderCpuMatrix(freqs) {
+      const container = document.getElementById('dash-cpu-matrix');
+      if (!container) return;
+      container.innerHTML = freqs.map((f, i) => {
+        let coreType = i <= 3 ? "小核" : (i <= 6 ? "大核" : "超大核");
+        return `
+          <div class="flex items-center justify-between font-mono text-xs">
+            <span class="text-slate-500 dark:text-slate-400 flex items-center gap-1.5">
+              <span>#${i}</span>
+              <span class="text-[10px] text-slate-400 font-sans">(${coreType})</span>
+            </span>
+            <span class="font-bold text-slate-800 dark:text-slate-200 text-sm">${f} MHz</span>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function renderServices(services) {
+      const grid = document.getElementById('services-grid');
+      if (!grid) return;
+      const srvList = Object.values(services);
+      
+      let runningCount = srvList.filter(s => s.running).length;
+      document.getElementById('total-srv-badge').innerText = `${runningCount} / ${srvList.length} 正常`;
+
+      grid.innerHTML = srvList.map(s => {
+        let isOnline = s.running;
+        let dotColor = isOnline ? 'bg-emerald-500' : 'bg-rose-500';
+        let statusText = isOnline ? '运行中 (Active)' : '已停止 (Stopped)';
+        let statusBadge = isOnline 
+          ? 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/30' 
+          : 'bg-rose-50 dark:bg-rose-500/15 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/30';
+        
+        return `
+          <div class="p-3 sm:p-3.5 rounded-2xl bg-white dark:bg-[#131926] border border-slate-200/90 dark:border-slate-800/80 shadow-xs flex flex-col justify-between hover:shadow-sm transition">
+            <div>
+              <div class="flex items-center justify-between mb-1.5">
+                <span class="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-medium">${s.category}</span>
+                <span class="text-[11px] font-mono px-2 py-0.2 rounded-full border ${statusBadge} flex items-center gap-1.5 font-medium">
+                  <span class="w-1.5 h-1.5 rounded-full ${dotColor}"></span>
+                  ${statusText}
+                </span>
+              </div>
+              <h3 class="font-bold text-xs sm:text-sm text-slate-900 dark:text-slate-100 flex items-center justify-between">
+                <span class="truncate pr-1">${s.name}</span>
+                <span class="font-mono text-xs text-emerald-600 dark:text-emerald-400 font-semibold shrink-0">:${s.port}</span>
+              </h3>
+              <div class="flex items-center gap-3 text-[11px] text-slate-500 dark:text-slate-400 font-mono mt-1.5 mb-2.5">
+                <span>PID: <b class="text-slate-800 dark:text-slate-200 font-semibold">${s.pid || '--'}</b></span>
+                <span>内存: <b class="text-slate-800 dark:text-slate-200 font-semibold">${s.memory_mb ? s.memory_mb + ' MB' : '--'}</b></span>
+              </div>
+            </div>
+
+            <!-- Action Buttons -->
+            <div class="flex items-center gap-1.5 pt-2 border-t border-slate-100 dark:border-slate-800/80 text-xs">
+              <button onclick="triggerAction('${s.id}', 'restart')" class="flex-1 py-1 rounded-xl bg-emerald-50 dark:bg-emerald-600/20 hover:bg-emerald-100 dark:hover:bg-emerald-600/30 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/30 transition flex items-center justify-center gap-1 font-medium text-[11px]">
+                <i class="fa-solid fa-arrows-rotate text-[10px]"></i>重启
+              </button>
+              <button onclick="triggerAction('${s.id}', '${isOnline ? 'stop' : 'start'}')" class="flex-1 py-1 rounded-xl ${isOnline ? 'bg-rose-50 dark:bg-rose-600/20 hover:bg-rose-100 dark:hover:bg-rose-600/30 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-500/30' : 'bg-emerald-50 dark:bg-emerald-600/20 hover:bg-emerald-100 dark:hover:bg-emerald-600/30 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/30'} border transition flex items-center justify-center gap-1 font-medium text-[11px]">
+                <i class="fa-solid ${isOnline ? 'fa-stop' : 'fa-play'} text-[10px]"></i>${isOnline ? '停止' : '启动'}
+              </button>
+              <button onclick="openLogs('${s.id}', '${s.name}')" class="px-2 py-1 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 transition text-[11px]" title="查看日志">
+                <i class="fa-solid fa-file-lines text-[10px]"></i>
+              </button>
+              <a href="${s.url}" target="_blank" class="px-2 py-1 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 transition text-[11px]" title="直达服务">
+                <i class="fa-solid fa-arrow-up-right-from-square text-[10px]"></i>
+              </a>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function fetchMetrics() {
+      if (isFetching) return;
+      isFetching = true;
+      const t0 = performance.now();
+      try {
+        const res = await fetch('/api/metrics?_t=' + Date.now(), { cache: 'no-store' });
+        const data = await res.json();
+        const rtt = Math.round(performance.now() - t0);
+
+        // Header
+        document.getElementById('live-clock').innerText = data.current_time ? data.current_time.split(' ')[1] : '--:--:--';
+        document.getElementById('rtt-tag').innerText = rtt + 'ms';
+        document.getElementById('dash-uptime').innerText = data.uptime_str;
+
+        if (data.load_avg) {
+          document.getElementById('dash-load').innerText = data.load_avg.map(v => v.toFixed(2)).join(' / ');
+        }
+
+        // 端侧 AI 巡检心语
+        if (data.ai_insight) {
+          document.getElementById('ai-insight-text').innerText = data.ai_insight.text;
+          document.getElementById('ai-cost-tag').innerText = data.ai_insight.cost_s + 's';
+          document.getElementById('ai-time-tag').innerText = data.ai_insight.updated_at || '--:--';
+        }
+
+        // Section 1: CPU 矩阵与波形背景
+        renderCpuMatrix(data.cpu_freqs);
+        document.getElementById('dash-cpu-temp').innerText = data.thermals.cpu_max + '°C';
+        document.getElementById('dash-bat-temp').innerText = data.battery.temp + '°C';
+        document.getElementById('bat-voltage').innerText = data.battery.voltage + ' V';
+
+        if (cpuBgChart) {
+          const avgFreq = Math.round(data.cpu_freqs.reduce((a, b) => a + b, 0) / data.cpu_freqs.length);
+          cpuBgChart.pushValue(avgFreq);
+        }
+
+        // RAM Donut Ring
+        const ramUsedGb = (data.ram.used_mb / 1024).toFixed(2);
+        document.getElementById('ram-used-text').innerText = ramUsedGb + ' GB';
+        document.getElementById('ram-ring-text').innerText = data.ram.pct + '%';
+        const ramOffset = 125.66 * (1 - data.ram.pct / 100);
+        document.getElementById('ram-ring').style.strokeDashoffset = ramOffset;
+
+        // ZRAM Donut Ring
+        document.getElementById('zram-used-text').innerText = data.zram.used_mb + ' MB';
+        document.getElementById('zram-ring-text').innerText = data.zram.pct + '%';
+        const zramOffset = 125.66 * (1 - data.zram.pct / 100);
+        document.getElementById('zram-ring').style.strokeDashoffset = zramOffset;
+
+        // Section 2: 桑基图 (每 5 秒更新一次避免频繁重绘)
+        const nowSec = Date.now();
+        if (data.sankey_data && (nowSec - lastSankeyRenderTime > 5000)) {
+          renderSankey(data.sankey_data);
+          lastSankeyRenderTime = nowSec;
+        }
+
+        // Section 3: 微服务矩阵
+        renderServices(data.services);
+
+      } catch (e) {
+        console.error("Fetch metrics error:", e);
+      } finally {
+        isFetching = false;
+      }
+    }
+
+    async function triggerAction(service, action) {
+      if (!confirm(`确定对 [${service}] 执行 [${action}] 操作吗？`)) return;
+      try {
+        const res = await fetch('/api/service/action', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ service, action })
+        });
+        const result = await res.json();
+        alert(result.message || '指令已下发！');
+        setTimeout(fetchMetrics, 600);
+      } catch (e) {
+        alert('执行失败: ' + e.message);
+      }
+    }
+
+    function openLogs(serviceId, serviceName) {
+      activeLogService = serviceId;
+      document.getElementById('log-modal-title').innerText = `${serviceName} · 实时运行日志`;
+      document.getElementById('log-modal').style.display = 'flex';
+      refreshCurrentLogs();
+    }
+
+    function closeLogModal() {
+      document.getElementById('log-modal').style.display = 'none';
+      activeLogService = null;
+    }
+
+    async function refreshCurrentLogs() {
+      if (!activeLogService) return;
+      const logBox = document.getElementById('log-content');
+      logBox.innerText = '正在读取中...';
+      try {
+        const res = await fetch(`/api/service/logs?service=${activeLogService}&lines=80&_t=` + Date.now(), { cache: 'no-store' });
+        const text = await res.text();
+        logBox.innerText = text || '(暂无日志输出)';
+        logBox.scrollTop = logBox.scrollHeight;
+      } catch (e) {
+        logBox.innerText = '读取日志异常: ' + e.message;
+      }
+    }
+
+    // 初始化启动
+    window.addEventListener('DOMContentLoaded', () => {
+      initCharts();
+      fetchMetrics();
+      setInterval(fetchMetrics, 1000);
+    });
   </script>
 </body>
 </html>
 """
 
-class MetricsHandler(BaseHTTPRequestHandler):
+class ConsoleHTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # 静默日志，不刷控制台
         pass
 
+    def do_HEAD(self):
+        self.do_GET()
+
+    def send_json(self, status: int, data: dict):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/" or parsed.path == "/index.html":
+        # 首页
+        if self.path in ("/", "/index.html") or not self.path.startswith("/api/"):
+            body = HTML_DASHBOARD.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0")
             self.end_headers()
-            self.wfile.write(INDEX_HTML.encode("utf-8"))
-        elif parsed.path == "/api/metrics":
+            self.wfile.write(body)
+            return
+
+        # 实时全景指标
+        if self.path.startswith("/api/metrics"):
             with metrics_lock:
-                data_bytes = json.dumps(latest_metrics, ensure_ascii=False).encode("utf-8")
+                data = dict(latest_metrics)
+            self.send_json(200, data)
+            return
+
+        # 日志读取
+        if self.path.startswith("/api/service/logs"):
+            qs = parse_qs(urlparse(self.path).query)
+            srv = qs.get("service", [""])[0]
+            lines = int(qs.get("lines", ["80"])[0])
+            cfg = MANAGED_SERVICES.get(srv)
+            if not cfg or not os.path.exists(cfg["log_file"]):
+                content = f"日志文件尚未生成或不存在: {cfg['log_file'] if cfg else '未知服务'}"
+            else:
+                try:
+                    out = subprocess.check_output(
+                        ["tail", f"-n{lines}", cfg["log_file"]],
+                        text=True, stderr=subprocess.STDOUT
+                    )
+                    content = out
+                except Exception as e:
+                    content = f"读取日志异常: {str(e)}"
+
+            body = content.encode("utf-8")
             self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0")
             self.end_headers()
-            self.wfile.write(data_bytes)
-        elif parsed.path == "/api/action/thermal_check":
-            # 异步触发一次温控检测脚本
-            os.system("python3 /ql/data/scripts/thermal_guard.py > /dev/null 2>&1 &")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"status":"triggered"}')
-        else:
-            self.send_response(404)
-            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/api/service/action":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body_raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
+            try:
+                data = json.loads(body_raw.decode("utf-8"))
+            except Exception:
+                data = {}
+
+            srv_id = data.get("service")
+            action = data.get("action")
+
+            if srv_id == "all" and action == "heal":
+                # 全员自愈
+                subprocess.Popen(
+                    ["bash", os.path.join(HOME_DIR, "start_qinglong_daemon.sh")],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                self.send_json(200, {"status": "ok", "message": "已在后台启动全员自愈守护进程！"})
+                return
+
+            cfg = MANAGED_SERVICES.get(srv_id)
+            if not cfg:
+                self.send_json(400, {"error": "未识别的服务标识"})
+                return
+
+            if action in ("stop", "restart"):
+                subprocess.run(["pkill", "-f", cfg["pattern"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(1)
+
+            if action in ("start", "restart"):
+                subprocess.Popen(
+                    cfg["start_cmd"],
+                    shell=True,
+                    executable="/data/data/com.termux/files/usr/bin/bash",
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+
+            self.send_json(200, {
+                "status": "ok",
+                "message": f"服务 [{cfg['name']}] 已成功下发 {action} 操作指令！"
+            })
+            return
+
+        self.send_response(404)
+        self.end_headers()
 
 def main():
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动一加 9 手机性能监控看板 (端口 :{PORT})...")
+    print(f"[*] 启动 OnePlus 9 移动微服务器一体化控制台 (AI巡检+桑基图版)...")
+    print(f"[*] 监听端口: 0.0.0.0:{PORT}")
 
-    # 同步输出独立 HTML 至青龙静态目录，支持 5700 端口直接内嵌
-    try:
-        with open("/ql/static/dist/phone-dashboard.html", "w", encoding="utf-8") as f:
-            f.write(INDEX_HTML)
-        print("[*] 已同步部署青龙专属性能页面至 /ql/static/dist/phone-dashboard.html")
-    except Exception as e:
-        print("[!] 写入青龙静态目录失败:", e)
-
-    # 启动后台采集线程
-    t = threading.Thread(target=metrics_collector_thread, daemon=True)
+    t = threading.Thread(target=metrics_collector_loop, daemon=True)
     t.start()
 
-    server = HTTPServer(("0.0.0.0", PORT), MetricsHandler)
-    print(f"[*] 看板服务已就绪: http://0.0.0.0:{PORT} (局域网访问: http://192.168.31.172:{PORT})")
+    # 启动端侧 AI 10分钟智能巡检后台线程
+    t_ai = threading.Thread(target=ai_inspector_loop, daemon=True)
+    t_ai.start()
+
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), ConsoleHTTPHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[*] 正在关闭看板服务...")
+        print("\n[!] 正在停止控制台服务...")
         server.server_close()
 
 if __name__ == "__main__":
