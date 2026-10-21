@@ -39,7 +39,7 @@ MANAGED_SERVICES = {
         "category": "端侧 AI",
         "pattern": "llama-server",
         "log_file": os.path.join(HOME_DIR, "llama_server.log"),
-        "start_cmd": f"nohup proot-distro login debian -- bash -c 'llama-server -m /ql/data/models/deepseek-r1-1.5b-q4_k_m.gguf --host 0.0.0.0 --port 8080 -c 2048 -t 4 --alias qwen2.5-3b' > {HOME_DIR}/llama_server.log 2>&1 &",
+        "start_cmd": f"nohup proot-distro login debian -- bash -c 'llama-server -m /ql/data/models/deepseek-r1-1.5b-q4_k_m.gguf --host 0.0.0.0 --port 8080 -c 2048 -t 4 --alias DeepSeek-R1-1.5B,deepseek-r1-1.5b,qwen2.5-3b' > {HOME_DIR}/llama_server.log 2>&1 &",
         "url": "http://192.168.31.172:8080"
     },
     "workbuddy": {

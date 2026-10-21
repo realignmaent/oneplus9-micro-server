@@ -17,8 +17,8 @@ fi
 
 # 4. 检查 Qwen2.5-3B llama-server 是否已启动，若未启动则拉起 (端口 8080)
 if ! pgrep -f "llama-server" > /dev/null; then
-    echo "[$(date)] 启动 Qwen2.5-3B 本地推理服务..."
-    nohup proot-distro login debian -- bash -c 'llama-server -m /ql/data/models/qwen2.5-3b-instruct-q4_k_m.gguf --host 0.0.0.0 --port 8080 -c 2048 -t 4 --alias qwen2.5-3b' > /data/data/com.termux/files/home/llama_server.log 2>&1 &
+    echo "[$(date)] 启动 DeepSeek-R1 本地推理服务..."
+    nohup proot-distro login debian -- bash -c 'llama-server -m /ql/data/models/deepseek-r1-1.5b-q4_k_m.gguf --host 0.0.0.0 --port 8080 -c 2048 -t 4 --alias DeepSeek-R1-1.5B,deepseek-r1-1.5b,qwen2.5-3b' > /data/data/com.termux/files/home/llama_server.log 2>&1 &
 fi
 
 # 5. 检查微服务器统一控制台 dashboard.py 是否已启动，若未启动则拉起 (端口 5701)
