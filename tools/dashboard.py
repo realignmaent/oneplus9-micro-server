@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 一加 9 (LE2110) 移动微服务器一体化控制台 (Mobile Micro-Server Console)
-DevCheck 全景版 + 端侧 Qwen2.5-3B 10分钟智能巡检心语 + 进程级内存桑基图 (Sankey Diagram)
+DevCheck 全景版 + 端侧 DeepSeek-R1 (1.5B) 10分钟智能巡检心语 + 进程级内存桑基图 (Sankey Diagram)
 """
 
 import os
@@ -34,12 +34,12 @@ MANAGED_SERVICES = {
     },
     "llama": {
         "id": "llama",
-        "name": "Qwen2.5-3B 本地推理引擎",
+        "name": "DeepSeek-R1-1.5B 本地推理引擎",
         "port": 8080,
         "category": "端侧 AI",
         "pattern": "llama-server",
         "log_file": os.path.join(HOME_DIR, "llama_server.log"),
-        "start_cmd": f"nohup proot-distro login debian -- bash -c 'llama-server -m /ql/data/models/qwen2.5-3b-instruct-q4_k_m.gguf --host 0.0.0.0 --port 8080 -c 2048 -t 4 --alias qwen2.5-3b' > {HOME_DIR}/llama_server.log 2>&1 &",
+        "start_cmd": f"nohup proot-distro login debian -- bash -c 'llama-server -m /ql/data/models/deepseek-r1-1.5b-q4_k_m.gguf --host 0.0.0.0 --port 8080 -c 2048 -t 4 --alias qwen2.5-3b' > {HOME_DIR}/llama_server.log 2>&1 &",
         "url": "http://192.168.31.172:8080"
     },
     "workbuddy": {
@@ -115,15 +115,16 @@ latest_metrics = {
         "prime": 0
     },
     "battery": {
+        "level": 70,
         "temp": 26.8,
         "voltage": 3.94,
-        "status": "稳态供电"
+        "status": "未充电 🔌"
     },
     "ram": {"total_mb": 11230, "used_mb": 0, "avail_mb": 0, "pct": 0.0},
     "zram": {"total_mb": 7679, "used_mb": 0, "free_mb": 7679, "pct": 0.0},
     "thermals": {"battery": 26.8, "cpu_max": 34.0, "status": "NORMAL"},
     "ai_insight": {
-        "text": "端侧 Qwen2.5-3B 正在就绪，首次巡检将在稍后生成...",
+        "text": "端侧 DeepSeek-R1 正在就绪，首次巡检将在稍后生成...",
         "updated_at": "--:--",
         "cost_s": 0.0
     },
@@ -220,6 +221,36 @@ def read_thermal_matrix():
     temps["status"] = "HIGH" if temps["battery"] >= 42.0 or temps["cpu_max"] >= 65.0 else "NORMAL"
     return temps
 
+cached_battery_data = {"level": 70, "status": "未充电 🔌", "ts": 0}
+
+def get_battery_status_cached():
+    """10秒缓存极速获取手机硬件电量与充电状态"""
+    global cached_battery_data
+    now_t = time.time()
+    if now_t - cached_battery_data["ts"] < 10:
+        return cached_battery_data["level"], cached_battery_data["status"]
+    
+    level = cached_battery_data["level"]
+    status_str = cached_battery_data["status"]
+    try:
+        out = subprocess.check_output(
+            ["adb", "-s", "127.0.0.1:5555", "shell", "dumpsys", "battery"],
+            text=True, stderr=subprocess.DEVNULL, timeout=1.5
+        )
+        charging = False
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("level:"):
+                level = int(line.split(":")[1].strip())
+            elif line.startswith("status:"):
+                st = int(line.split(":")[1].strip())
+                charging = (st == 2)
+        status_str = "充电中 ⚡" if charging else ("已充满 ✨" if level >= 100 else "未充电 🔌")
+        cached_battery_data = {"level": level, "status": status_str, "ts": now_t}
+    except Exception:
+        cached_battery_data["ts"] = now_t
+    return level, status_str
+
 def read_cpu_freqs():
     """读取 8 核当前动态时钟频率 (MHz)"""
     freqs = []
@@ -296,7 +327,7 @@ def get_process_memory_tree(mem_data, services_status):
         {"name": "完全空闲内存", "value": max(100, ram_free), "itemStyle": {"color": "#94a3b8"}},
         {"name": "ZRAM 压缩已用", "value": zram_used, "itemStyle": {"color": "#6366f1"}},
         {"name": "ZRAM 空闲池", "value": zram_free, "itemStyle": {"color": "#a855f7"}},
-        {"name": "Qwen2.5-3B 推理引擎", "value": llama_mb, "itemStyle": {"color": "#f59e0b"}},
+        {"name": "DeepSeek-R1 推理引擎", "value": llama_mb, "itemStyle": {"color": "#f59e0b"}},
         {"name": "青龙自动化面板", "value": ql_mb, "itemStyle": {"color": "#ef4444"}},
         {"name": "WorkBuddy 控制台", "value": wb_mb, "itemStyle": {"color": "#0284c7"}},
         {"name": "PRoot 容器隔离层", "value": proot_mb, "itemStyle": {"color": "#0d9488"}},
@@ -310,7 +341,7 @@ def get_process_memory_tree(mem_data, services_status):
         {"source": "物理 RAM", "target": "完全空闲内存", "value": max(100, ram_free)},
         {"source": "ZRAM 交换区", "target": "ZRAM 压缩已用", "value": zram_used},
         {"source": "ZRAM 交换区", "target": "ZRAM 空闲池", "value": zram_free},
-        {"source": "已分配进程内存", "target": "Qwen2.5-3B 推理引擎", "value": llama_mb},
+        {"source": "已分配进程内存", "target": "DeepSeek-R1 推理引擎", "value": llama_mb},
         {"source": "已分配进程内存", "target": "青龙自动化面板", "value": ql_mb},
         {"source": "已分配进程内存", "target": "WorkBuddy 控制台", "value": wb_mb},
         {"source": "已分配进程内存", "target": "PRoot 容器隔离层", "value": proot_mb},
@@ -321,7 +352,7 @@ def get_process_memory_tree(mem_data, services_status):
     return {"nodes": nodes, "links": links}
 
 def ai_inspector_loop():
-    """端侧 Qwen2.5-3B 每 10 分钟自动状态分析线程"""
+    """端侧 DeepSeek-R1-1.5B 每 10 分钟自动状态分析线程"""
     global latest_metrics
     # 启动等待 8 秒避免挤占开机资源
     time.sleep(8)
@@ -330,23 +361,25 @@ def ai_inspector_loop():
             with metrics_lock:
                 c_temp = latest_metrics["thermals"].get("cpu_max", 34.0)
                 b_temp = latest_metrics["battery"].get("temp", 27.0)
+                b_lvl = latest_metrics["battery"].get("level", 70)
+                b_st = latest_metrics["battery"].get("status", "未充电")
                 ram_pct = latest_metrics["ram"].get("pct", 55.0)
                 load_val = latest_metrics["load_avg"][0] if latest_metrics["load_avg"] else 5.0
                 srv_online = sum(1 for s in latest_metrics["services"].values() if s.get("running"))
-                total_srv = len(latest_metrics["services"]) or 5
+                total_srv = len(latest_metrics["services"]) or 6
 
-            prompt_user = f"CPU温度{c_temp}°C，电池{b_temp}°C，内存占用{ram_pct}%，负载{load_val:.1f}，{srv_online}/{total_srv}个微服务在线。"
+            prompt_user = f"电量{b_lvl}%({b_st})，CPU{c_temp}°C，电池{b_temp}°C，内存{ram_pct}%，负载{load_val:.1f}，{srv_online}/{total_srv}个微服务在线。"
             payload = {
                 "model": "qwen2.5-3b",
                 "messages": [
                     {
                         "role": "system",
-                        "content": "你是安装在一加9手机微服务器上的端侧AI助手，23岁俏皮贴心同龄人设。请根据手机运行状态，用一句话（20字以内）给出简练、生动、有温度的巡检结论。直接输出结论即可，无需多余寒暄。"
+                        "content": "你是陪伴在一加9手机里的端侧AI女孩，23岁俏皮贴心同龄好友（直接用第一人称对我说话，严禁出现'用户'二字）。请简短推演后，用一句话（20字以内）给出简练、俏皮、充满陪伴感的运行结论。"
                     },
                     {"role": "user", "content": prompt_user}
                 ],
-                "temperature": 0.7,
-                "max_tokens": 40
+                "temperature": 0.6,
+                "max_tokens": 280
             }
 
             t0 = time.time()
@@ -355,9 +388,17 @@ def ai_inspector_loop():
                 data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"}
             )
-            with urllib.request.urlopen(req, timeout=45) as res:
+            with urllib.request.urlopen(req, timeout=90) as res:
                 resp = json.loads(res.read().decode("utf-8"))
-                reply = resp["choices"][0]["message"]["content"].strip()
+                choice = resp["choices"][0]["message"]
+                reply = choice.get("content", "").strip()
+                if not reply and choice.get("reasoning_content"):
+                    r_text = choice.get("reasoning_content").strip()
+                    sentences = [s.strip() for s in re.split(r'[。！？\n]', r_text) if s.strip()]
+                    reply = sentences[-1] if sentences else "微服务器状态平稳，各项服务都很乖哦~ ✨"
+                if not reply:
+                    reply = "一加 9 全局状态平稳，微服务运转正常~ ✨"
+
                 cost = time.time() - t0
                 now_str = time.strftime("%H:%M", time.localtime())
 
@@ -373,7 +414,7 @@ def ai_inspector_loop():
             with metrics_lock:
                 if "正在就绪" in latest_metrics["ai_insight"]["text"]:
                     latest_metrics["ai_insight"] = {
-                        "text": "一加 9 全局状态平稳，核心温度微凉，微服务矩阵持续健康运转中。",
+                        "text": "一加 9 全局状态平稳，温度温润，微服务运转正常~ ✨",
                         "updated_at": now_str,
                         "cost_s": 0.0
                     }
@@ -432,10 +473,12 @@ def metrics_collector_loop():
                     "big": big_avg,
                     "prime": prime_val
                 }
+                bat_lvl, bat_st = get_battery_status_cached()
                 latest_metrics["battery"] = {
+                    "level": bat_lvl,
                     "temp": thermals["battery"],
                     "voltage": thermals["vbat"],
-                    "status": "稳态供电"
+                    "status": bat_st
                 }
                 latest_metrics["cpu_cores_temp"] = thermals["cpu_cores"]
                 latest_metrics["ram"] = mem_data["ram"]
@@ -537,7 +580,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         </div>
         <div>
           <div class="flex items-center gap-2">
-            <span class="text-xs font-bold text-emerald-800 dark:text-emerald-300 font-mono tracking-tight uppercase">端侧 Qwen2.5-3B 智能巡检</span>
+            <span class="text-xs font-bold text-emerald-800 dark:text-emerald-300 font-mono tracking-tight uppercase">端侧 DeepSeek-R1 智能巡检</span>
             <span class="text-[10px] text-slate-500 dark:text-slate-400 font-mono" id="ai-update-tag">每10分钟分析</span>
           </div>
           <p class="text-xs sm:text-sm font-semibold text-slate-800 dark:text-slate-100 mt-0.5" id="ai-insight-text">
@@ -605,10 +648,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
               <div class="space-y-0.5">
                 <span class="text-[11px] font-semibold text-slate-500 dark:text-slate-400">电池核心</span>
                 <div class="text-base font-bold text-slate-900 dark:text-white flex items-baseline gap-1.5">
-                  <span id="bat-voltage">-- V</span>
-                  <span id="dash-bat-temp" class="text-xs font-semibold text-emerald-600 dark:text-emerald-400">--°C</span>
+                  <span id="dash-bat-level" class="font-mono text-emerald-600 dark:text-emerald-400 text-lg">--%</span>
+                  <span id="bat-voltage" class="text-xs text-slate-500 font-mono">-- V</span>
+                  <span id="dash-bat-temp" class="text-xs font-semibold text-slate-400">--°C</span>
                 </div>
-                <p class="text-[10px] text-slate-500">稳态直流供电</p>
+                <p id="dash-bat-status" class="text-[10px] text-slate-500">未充电 🔌</p>
               </div>
               <div class="w-8 h-8 rounded-xl bg-emerald-50 dark:bg-emerald-500/10 flex items-center justify-center text-emerald-600 dark:text-emerald-400">
                 <i class="fa-solid fa-battery-three-quarters text-sm"></i>
@@ -1078,8 +1122,16 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         // Section 1: CPU 矩阵与波形背景
         renderCpuMatrix(data.cpu_freqs);
         document.getElementById('dash-cpu-temp').innerText = data.thermals.cpu_max + '°C';
-        document.getElementById('dash-bat-temp').innerText = data.battery.temp + '°C';
-        document.getElementById('bat-voltage').innerText = data.battery.voltage + ' V';
+        if (data.battery) {
+          if (document.getElementById('dash-bat-level') && data.battery.level !== undefined) {
+            document.getElementById('dash-bat-level').innerText = data.battery.level + '%';
+          }
+          document.getElementById('dash-bat-temp').innerText = data.battery.temp + '°C';
+          document.getElementById('bat-voltage').innerText = data.battery.voltage + ' V';
+          if (document.getElementById('dash-bat-status') && data.battery.status) {
+            document.getElementById('dash-bat-status').innerText = data.battery.status;
+          }
+        }
 
         if (cpuBgChart) {
           const avgFreq = Math.round(data.cpu_freqs.reduce((a, b) => a + b, 0) / data.cpu_freqs.length);
