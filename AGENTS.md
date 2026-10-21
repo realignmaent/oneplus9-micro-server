@@ -44,7 +44,7 @@
 | **wb2api 网关核心** | **:7863** | Go 1.22.5 ARM64 原生可执行文件 | `/opt/workbuddy-manager/upstream` | 企微 Token 鉴权，OpenAI 兼容反代（纯内存/Noop Redis 模式） |
 | **青龙自动化面板** | **:5700** | Node.js Express + UmiJS | `/ql` | 定时任务平台，注入了 `phone_addon.js` 全景性能看板与状态胶囊 |
 | **实时硬件遥测看板** | **:5701** | 原生 Python 3 `dashboard.py` | `/ql/data/scripts/dashboard.py` | 零依赖秒级采集 `/sys` 温度、内存、频率，写出 `phone_metrics.json` |
-| **端侧大模型 API** | **:8080** | llama-server ARM 原生 | `/ql/data/models/` | 加载 `qwen2.5-3b-instruct-q4_k_m.gguf` 进行本地脱机推理 |
+| **端侧大模型 API** | **:8080** | llama-server ARM 原生 | `/ql/data/models/` | 加载 `deepseek-r1-1.5b-q4_k_m.gguf` 进行本地脱机思维链与同龄陪伴推演 |
 | **QoderGateway 网关** | **:5050** | Python 3.11 FastAPI + Uvicorn | `/opt/qodergateway/.env` | Qoder 多账号 OpenAI 接口转换与 WebUI 控制台，文档站与账号轮转 |
 | **Termux SSH** | **:8022** | OpenSSH | `~/.ssh/authorized_keys` | 手机远程管理终端通道 |
 
