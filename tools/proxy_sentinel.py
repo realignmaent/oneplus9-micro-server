@@ -25,13 +25,13 @@ from datetime import datetime
 import requests
 
 # ─── 多通道通知配置区（完全对齐 workbuddy_cron.py）────────────────────
-WXPUSHER_APP_TOKEN = (os.environ.get("WXPUSHER_APP_TOKEN") or "AT_MsTJEWfskNXx7idvlXQ9PUtR2FP0tY68").strip()
-WXPUSHER_UID = (os.environ.get("WXPUSHER_UID") or "UID_4Da2D4Sifp9Wkvyf54PlTOymN4lR").strip()
+WXPUSHER_APP_TOKEN = os.environ.get("WXPUSHER_APP_TOKEN", "").strip()
+WXPUSHER_UID = os.environ.get("WXPUSHER_UID", "").strip()
 BARK_KEY = os.environ.get("BARK_KEY", "").strip()
 SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY", "").strip()
 DINGTALK_WEBHOOK = os.environ.get("DINGTALK_WEBHOOK", "").strip()
 FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK", "").strip()
-PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "8dd9f3de8ecb45f7879593f0ea61c115").strip()
+PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "").strip()
 
 # 路径基线配置 (支持 Debian 容器内与 Termux 宿主自适应)
 IN_CONTAINER = os.path.exists("/ql/data")

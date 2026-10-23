@@ -26,8 +26,8 @@ import requests
 # ─── 多通道通知配置区（任选其一填入即可，其他留空）────────────────────
 
 # 1. WxPusher（官网: https://wxpusher.zjiecode.com/）
-WXPUSHER_APP_TOKEN = (os.environ.get("WXPUSHER_APP_TOKEN") or "AT_MsTJEWfskNXx7idvlXQ9PUtR2FP0tY68").strip()
-WXPUSHER_UID = (os.environ.get("WXPUSHER_UID") or "UID_4Da2D4Sifp9Wkvyf54PlTOymN4lR").strip()
+WXPUSHER_APP_TOKEN = os.environ.get("WXPUSHER_APP_TOKEN", "").strip()
+WXPUSHER_UID = os.environ.get("WXPUSHER_UID", "").strip()
 
 # 2. Bark（iOS 苹果专属原生推送神器，App Store 搜 Bark，打开即用，无需注册）
 BARK_KEY = os.environ.get("BARK_KEY", "").strip()
@@ -42,7 +42,7 @@ DINGTALK_WEBHOOK = os.environ.get("DINGTALK_WEBHOOK", "").strip()
 FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK", "").strip()
 
 # 6. PushPlus（原有配置）
-PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "8dd9f3de8ecb45f7879593f0ea61c115").strip()
+PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "").strip()
 
 # 账号凭据目录（留空则自动探测）
 AUTHS_DIR = os.environ.get("AUTHS_DIR", "").strip()

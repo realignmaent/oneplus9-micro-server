@@ -30,13 +30,13 @@ THRESHOLDS = {
 }
 
 # ─── 多通道通知配置区 ───────────────────────────────────────────────
-WXPUSHER_APP_TOKEN = (os.environ.get("WXPUSHER_APP_TOKEN") or "AT_MsTJEWfskNXx7idvlXQ9PUtR2FP0tY68").strip()
-WXPUSHER_UID = (os.environ.get("WXPUSHER_UID") or "UID_4Da2D4Sifp9Wkvyf54PlTOymN4lR").strip()
+WXPUSHER_APP_TOKEN = os.environ.get("WXPUSHER_APP_TOKEN", "").strip()
+WXPUSHER_UID = os.environ.get("WXPUSHER_UID", "").strip()
 BARK_KEY = os.environ.get("BARK_KEY", "").strip()
 SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY", "").strip()
 DINGTALK_WEBHOOK = os.environ.get("DINGTALK_WEBHOOK", "").strip()
 FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK", "").strip()
-PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "8dd9f3de8ecb45f7879593f0ea61c115").strip()
+PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "").strip()
 
 # 状态记录文件
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thermal_state.json")
