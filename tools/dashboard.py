@@ -40,7 +40,7 @@ MANAGED_SERVICES = {
         "pattern": "llama-server",
         "log_file": os.path.join(HOME_DIR, "llama_server.log"),
         "start_cmd": f"nohup proot-distro login debian -- bash -c 'llama-server -m /ql/data/models/deepseek-r1-1.5b-q4_k_m.gguf --host 0.0.0.0 --port 8080 -c 2048 -t 4 --alias DeepSeek-R1-1.5B,deepseek-r1-1.5b,qwen2.5-3b' > {HOME_DIR}/llama_server.log 2>&1 &",
-        "url": "http://192.168.31.172:8080"
+        "url": "http://192.168.31.172:8080/v1/models"
     },
     "workbuddy": {
         "id": "workbuddy",
@@ -60,7 +60,7 @@ MANAGED_SERVICES = {
         "pattern": "wb2api",
         "log_file": os.path.join(HOME_DIR, "wb2api.log"),
         "start_cmd": f"nohup proot-distro login debian -- bash -c 'cd /opt/workbuddy-manager/upstream && ./wb2api -config config.json' > {HOME_DIR}/wb2api.log 2>&1 &",
-        "url": "http://192.168.31.172:7863"
+        "url": "http://192.168.31.172:7863/healthz"
     },
     "public_gateway": {
         "id": "public_gateway",
@@ -70,7 +70,7 @@ MANAGED_SERVICES = {
         "pattern": "public_ai_gateway.py",
         "log_file": os.path.join(HOME_DIR, "logs", "gateway.log"),
         "start_cmd": f"bash {HOME_DIR}/start_public_ai.sh > /dev/null 2>&1 &",
-        "url": "http://192.168.31.172:8081"
+        "url": "https://192.168.31.172:8082/health"
     },
     "qodergateway": {
         "id": "qodergateway",
@@ -80,7 +80,17 @@ MANAGED_SERVICES = {
         "pattern": "qoder2api.app",
         "log_file": os.path.join(HOME_DIR, "qodergateway.log"),
         "start_cmd": f"nohup proot-distro login debian -- bash -c 'cd /opt/qodergateway && PYTHONPATH=src python3 -m qoder2api.app --host 0.0.0.0 --port 5050' > {HOME_DIR}/qodergateway.log 2>&1 &",
-        "url": "http://192.168.31.172:5050"
+        "url": "https://192.168.31.172:5050/console"
+    },
+    "devcheck": {
+        "id": "devcheck",
+        "name": "DevCheck 控制台",
+        "port": 5701,
+        "category": "监控面板",
+        "pattern": "dashboard.py",
+        "log_file": os.path.join(HOME_DIR, "dashboard.log"),
+        "start_cmd": f"nohup python {HOME_DIR}/dashboard.py > {HOME_DIR}/dashboard.log 2>&1 &",
+        "url": "http://192.168.31.172:5701"
     }
 }
 
@@ -458,6 +468,15 @@ def metrics_collector_loop():
                     "pid": pid,
                     "memory_mb": rss_mb
                 }
+
+                if s_key == "public_gateway":
+                    try:
+                        with open(os.path.join(HOME_DIR, "public_url.txt"), "r", encoding="utf-8") as public_file:
+                            public_url = public_file.read().strip()
+                        if public_url:
+                            services_status[s_key]["url"] = public_url.rstrip("/") + "/health"
+                    except OSError:
+                        pass
 
             sankey_tree = get_process_memory_tree(mem_data, services_status)
 

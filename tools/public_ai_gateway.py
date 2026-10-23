@@ -1,31 +1,71 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-一加 9 端侧大模型公网安全气囊网关 (Public AI Streaming Gateway)
-架构：
-  1. 完整反代官方原生 llama-server WebUI (具备左侧历史边栏、Token吞吐速率统计、消息操作栏)
-  2. 深度支持 SSE (Server-Sent Events) 逐字流式打字机输出
-  3. 第一道防线：Cookie 免登录暗号门禁 (默认 888，100% 阻断全网爬虫扫描)
-  4. 第二道防线：45°C 电池温控熔断器
-  5. 第三道防线：单并发排队锁 (Lock=1)，坚决杜绝多任务并发榨干 CPU
+OnePlus 9 双反代安全融合网关 (Dual Reverse-Proxy Security Gateway)
+聚合两大上游服务：
+  1. QoderGateway (:5050) -> 阿里通义千问、DeepSeek、智谱GLM、月之暗面Kimi、MiniMax (1M 上下文 + 极致推理)
+  2. WorkBuddy (:7863)   -> GPT-6-Sol, Grok-4.7, Hy4-preview, 全球大模型
+  3. 端侧脱机模型 (:8080) -> Qwen2.5-3B (备用)
+
+安全防护机制：
+  1. 严格白名单路由：仅放行 /v1/models, /v1/chat/completions 以及 /qoder/v1/*, /wb/v1/*
+     绝不暴露 /console, /ui, /admin 等任何管理路径 (100% 403 阻断扫描)
+  2. Bearer Token 虚拟化鉴权门禁：无有效 API Key 直接 401 丢弃，防扫描与爬虫
+  3. 异常 IP 防刷封禁：连续 5 次鉴权失败封禁 10 分钟
+  4. 手机 45°C 电池/主板温控保护：过热熔断返回 429，保护一加 9 硬件健康
+  5. 纯客户端极简适配：完美兼容 cc-switch / CherryStudio / NextChat，支持流式 SSE 打字机输出
 """
 
 import os
 import sys
 import json
 import time
+import ssl
 import http.client
 import urllib.parse
+
+import gateway_tokens
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 import threading
+from collections import defaultdict
 
+# 监听端口（对接 Cloudflare Tunnel 出站）
 PORT = int(os.environ.get("GATEWAY_PORT", 8081))
-BACKEND_HOST = os.environ.get("LLM_HOST", "127.0.0.1")
-BACKEND_PORT = int(os.environ.get("LLM_PORT", 8080))
-ACCESS_CODE = os.environ.get("ACCESS_CODE", "888").strip()
+# 局域网 HTTPS API 端口（只暴露 API 路径，管理面留在 :5050 回环）
+LAN_HTTPS_PORT = int(os.environ.get("GATEWAY_HTTPS_PORT", 8082))
+TLS_CERT_FILE = os.environ.get(
+    "GATEWAY_CERT_FILE", "/data/data/com.termux/files/home/certs/cert.pem"
+)
+TLS_KEY_FILE = os.environ.get(
+    "GATEWAY_KEY_FILE", "/data/data/com.termux/files/home/certs/key.pem"
+)
+
+# 上游内网端口与鉴权
+# 凭据一律不入库：手机端由守护脚本注入 GATEWAY_QODER_KEY / GATEWAY_WB_KEY /
+# GATEWAY_STATIC_KEYS（逗号分隔）。仓库这份是逻辑快照，与手机实跑副本仅差这几行常量。
+QODER_HOST = "127.0.0.1"
+QODER_PORT = 5050
+QODER_KEY = os.environ.get("GATEWAY_QODER_KEY", "")
+
+WB_HOST = "127.0.0.1"
+WB_PORT = 7863
+WB_KEY = os.environ.get("GATEWAY_WB_KEY", "test_key")
+
+LOCAL_LLM_HOST = "127.0.0.1"
+LOCAL_LLM_PORT = 8080
+
+# 内部静态 Key（仅用户本人 Qoder Key）；朋友 Key 走 SQLite 哈希 token
+STATIC_KEYS = {
+    k.strip() for k in os.environ.get("GATEWAY_STATIC_KEYS", "").split(",") if k.strip()
+}
+
 MAX_TEMP_CELSIUS = float(os.environ.get("MAX_TEMP_CELSIUS", 45.0))
 
-inference_lock = threading.Lock()
+# 防火墙与限流数据结构
+failed_attempts = defaultdict(list)  # ip -> list of timestamps
+banned_ips = {}                      # ip -> ban_expiry_timestamp
+request_history = defaultdict(list)  # ip -> list of timestamps
+rate_lock = threading.Lock()
 
 def get_battery_temp() -> float:
     """读取手机当前电池或主板温度"""
@@ -44,352 +84,410 @@ def get_battery_temp() -> float:
             continue
     return 32.0
 
-AUTH_HTML = """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>OnePlus 9 · 访问验证</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-      color: #f8fafc;
-      height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
-    }
-    .card {
-      background: rgba(30, 41, 59, 0.7);
-      backdrop-filter: blur(20px);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      border-radius: 20px;
-      padding: 32px 28px;
-      width: 100%;
-      max-width: 380px;
-      text-align: center;
-      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
-    }
-    .icon {
-      font-size: 42px;
-      margin-bottom: 16px;
-      display: inline-block;
-      animation: pulse 2s infinite ease-in-out;
-    }
-    @keyframes pulse {
-      0%, 100% { transform: scale(1); }
-      50% { transform: scale(1.08); }
-    }
-    h2 {
-      font-size: 20px;
-      font-weight: 700;
-      margin-bottom: 8px;
-      letter-spacing: -0.5px;
-    }
-    p {
-      font-size: 13px;
-      color: #94a3b8;
-      line-height: 1.6;
-      margin-bottom: 24px;
-    }
-    .badge {
-      display: inline-block;
-      background: rgba(59, 130, 246, 0.15);
-      border: 1px solid rgba(59, 130, 246, 0.3);
-      color: #60a5fa;
-      padding: 4px 10px;
-      border-radius: 20px;
-      font-size: 11px;
-      margin-bottom: 16px;
-      font-weight: 500;
-    }
-    input {
-      width: 100%;
-      padding: 12px 16px;
-      background: rgba(15, 23, 42, 0.6);
-      border: 1px solid rgba(255, 255, 255, 0.15);
-      border-radius: 12px;
-      font-size: 16px;
-      color: #fff;
-      text-align: center;
-      outline: none;
-      margin-bottom: 18px;
-      letter-spacing: 3px;
-      transition: all 0.2s;
-    }
-    input:focus {
-      border-color: #3b82f6;
-      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
-      background: rgba(15, 23, 42, 0.9);
-    }
-    button {
-      width: 100%;
-      padding: 12px;
-      background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
-      color: white;
-      border: none;
-      border-radius: 12px;
-      font-size: 15px;
-      font-weight: 600;
-      cursor: pointer;
-      box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);
-      transition: transform 0.1s, opacity 0.2s;
-    }
-    button:active {
-      transform: scale(0.98);
-      opacity: 0.9;
-    }
-    .err-msg {
-      color: #f87171;
-      font-size: 12px;
-      margin-top: 12px;
-      display: none;
-    }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="icon">✨</div>
-    <h2>OnePlus 9 移动微服务器</h2>
-    <div class="badge">高通骁龙 888 · Qwen2.5-3B 端侧脱机大模型</div>
-    <p>这是好友专属的家庭手机端侧 AI 智能体<br/>请输入主人告知的访问暗号开启畅聊体验</p>
-    <input type="password" id="passcode" placeholder="输入访问暗号" autocomplete="off" autofocus />
-    <button onclick="doVerify()">开启对话</button>
-    <div class="err-msg" id="err-text">暗号不正确，请向主人获取哦~</div>
-  </div>
 
-  <script>
-    const input = document.getElementById('passcode');
-    const errText = document.getElementById('err-text');
-
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') doVerify();
-    });
-
-    async function doVerify() {
-      const code = input.value.trim();
-      if (!code) return;
-      try {
-        const res = await fetch('/api/op9_verify', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ code: code })
-        });
-        if (res.ok) {
-          // 写入 Cookie 并秒级刷新页面进入官方原生高级界面
-          document.cookie = "op9_code=" + encodeURIComponent(code) + "; path=/; max-age=2592000; SameSite=Lax";
-          location.reload();
-        } else {
-          errText.style.display = 'block';
-          input.value = '';
-          input.focus();
-        }
-      } catch (e) {
-        alert('连接异常: ' + e.message);
-      }
-    }
-  </script>
-</body>
-</html>
-"""
-
-class PublicStreamingProxyHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass
-
-    def check_authenticated(self) -> bool:
-        """检查请求是否携带合法暗号 (Cookie 或 Header 或 Query)"""
-        # 1. 检查 Cookie
-        cookies = self.headers.get("Cookie", "")
-        if cookies:
-            for item in cookies.split(";"):
-                if "=" in item:
-                    k, v = item.strip().split("=", 1)
-                    if k == "op9_code" and urllib.parse.unquote(v) == ACCESS_CODE:
-                        return True
-        # 2. 检查 Header
-        if self.headers.get("X-Access-Code") == ACCESS_CODE:
-            return True
-        # 3. 检查 Query 参数
-        if "?" in self.path:
-            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            if qs.get("code", [""])[0].strip() == ACCESS_CODE:
+def is_ip_banned(client_ip: str) -> bool:
+    now = time.time()
+    with rate_lock:
+        if client_ip in banned_ips:
+            if now < banned_ips[client_ip]:
                 return True
+            else:
+                del banned_ips[client_ip]
         return False
 
-    def send_auth_page(self):
-        """返回好看的暗号验证门禁页面"""
-        body = AUTH_HTML.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+
+def record_failed_attempt(client_ip: str):
+    now = time.time()
+    with rate_lock:
+        # 清理 5 分钟之前的记录
+        failed_attempts[client_ip] = [t for t in failed_attempts[client_ip] if now - t < 300]
+        failed_attempts[client_ip].append(now)
+        if len(failed_attempts[client_ip]) >= 5:
+            banned_ips[client_ip] = now + 600  # 封禁 10 分钟
+            print(f"[WAF BAN] IP {client_ip} has been banned for 10 minutes due to 5 consecutive auth failures.")
+
+
+def is_rate_limited(client_ip: str) -> bool:
+    now = time.time()
+    with rate_lock:
+        request_history[client_ip] = [t for t in request_history[client_ip] if now - t < 60]
+        if len(request_history[client_ip]) > 60:  # 60 req/min
+            return True
+        request_history[client_ip].append(now)
+        return False
+
+
+# Qoder 原生支持的典型模型前缀/集合
+QODER_MODEL_HINTS = {
+    "auto",
+    "qwen3.8-max", "qwen3.8-flash", "qwen3.7-plus",
+    "deepseek-v4-pro", "deepseek-flash",
+    "glm-5.3", "glm-5.3-flash",
+    "kimi-k3", "kimi-k2.8",
+    "minimax-m3.1-flash"
+}
+
+
+class DualProxyHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    client_usage_key = ""
+
+    def get_client_ip(self) -> str:
+        # 兼容 Cloudflare 边缘真实客户端 IP
+        return self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For", "").split(",")[0].strip() or self.client_address[0]
+
+    def verify_auth(self) -> bool:
+        auth_header = self.headers.get("Authorization", "").strip()
+        if not auth_header.startswith("Bearer "):
+            return False
+        token = auth_header[7:].strip()
+        if token in STATIC_KEYS:
+            self.client_usage_key = token
+            return True
+        ok, _, _ = gateway_tokens.verify_token(token, self.get_client_ip())
+        if ok:
+            # 只透传非敏感前缀，QoderGateway 用它做用量归因而不是上游鉴权
+            self.client_usage_key = token[: gateway_tokens.PREFIX_LEN]
+        return ok
+
+    def make_conn(self, host: str, port: int, timeout: int):
+        """QoderGateway 已在 :5050 启用 HTTPS；同机回环连接跳过证书校验。"""
+        if host == QODER_HOST and port == QODER_PORT:
+            return http.client.HTTPSConnection(
+                host, port, timeout=timeout, context=ssl._create_unverified_context()
+            )
+        return http.client.HTTPConnection(host, port, timeout=timeout)
+
+    def send_json(self, status_code: int, data: dict):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
         self.wfile.write(body)
 
     def do_OPTIONS(self):
-        self.send_response(200)
+        # 跨域预检支持（cc-switch / WebUI 调用必须）
+        self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.end_headers()
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
 
     def do_GET(self):
-        # 1. 检查暗号认证
-        if not self.check_authenticated():
-            # 根路径返回暗号门禁，静态资源与接口拦截 403
-            clean_path = self.path.split("?")[0]
-            if clean_path in ("/", "/index.html") or not "." in clean_path:
-                self.send_auth_page()
-            else:
-                self.send_response(403)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(b'{"error": "Forbidden: Please authenticate via main page"}')
+        client_ip = self.get_client_ip()
+
+        # 1. 检查 IP 封禁
+        if is_ip_banned(client_ip):
+            self.send_json(403, {"error": "Your IP has been temporarily blocked due to repeated violations."})
             return
 
-        # 2. 认证通过，透明反向代理
-        self.forward_to_backend("GET")
+        # 2. 根路径保活诊断
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        if path == "" or path == "/health":
+            self.send_json(200, {
+                "service": "OnePlus 9 Dual Reverse-Proxy Gateway",
+                "status": "online",
+                "hardware": "Snapdragon 888 (12GB RAM)",
+                "endpoints": {
+                    "unified": "/v1",
+                    "anthropic": "/v1/messages",
+                    "qoder_direct": "/qoder/v1",
+                    "workbuddy_direct": "/wb/v1"
+                },
+                "usage": "Configure API Base URL in cc-switch with Bearer Key."
+            })
+            return
+
+        # 3. 路由收敛白名单检测：严禁访问 /console, /ui 等敏感后台
+        is_qoder_models = path in ("/qoder/v1/models", "/qoder/models")
+        is_wb_models = path in ("/wb/v1/models", "/wb/models")
+        is_unified_models = path in ("/v1/models", "/models")
+
+        if not (is_qoder_models or is_wb_models or is_unified_models):
+            # 严格拦截所有扫描请求（如 /console, /ui, /admin, /.env 等）
+            record_failed_attempt(client_ip)
+            self.send_json(403, {"error": "Access Denied: Path not allowed by security policy."})
+            return
+
+        # 4. Bearer Key 鉴权门禁
+        if not self.verify_auth():
+            record_failed_attempt(client_ip)
+            self.send_json(401, {
+                "error": {
+                    "code": "invalid_api_key",
+                    "message": "Missing or invalid API key. Please check your Bearer token.",
+                    "type": "invalid_request_error"
+                }
+            })
+            return
+
+        # 5. 限流检查
+        if is_rate_limited(client_ip):
+            self.send_json(429, {"error": "Rate limit exceeded. Please slow down."})
+            return
+
+        # 6. 分发处理模型列表
+        if is_qoder_models:
+            self.forward_single_models(QODER_HOST, QODER_PORT, QODER_KEY)
+        elif is_wb_models:
+            self.forward_single_models(WB_HOST, WB_PORT, WB_KEY)
+        else:
+            # 统一聚合模式：合并 Qoder 与 WorkBuddy 的所有可用模型
+            self.handle_aggregated_models()
 
     def do_POST(self):
-        # 校验暗号专用验证接口
-        if self.path == "/api/op9_verify":
-            content_length = int(self.headers.get("Content-Length", 0))
-            body_raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
-            try:
-                data = json.loads(body_raw.decode("utf-8"))
-            except Exception:
-                data = {}
-            if data.get("code") == ACCESS_CODE:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Set-Cookie", f"op9_code={urllib.parse.quote(ACCESS_CODE)}; Path=/; Max-Age=2592000; SameSite=Lax")
-                self.end_headers()
-                self.wfile.write(b'{"status": "ok"}')
-            else:
-                self.send_response(401)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"error": "Invalid code"}')
+        client_ip = self.get_client_ip()
+
+        # 1. 检查 IP 封禁
+        if is_ip_banned(client_ip):
+            self.send_json(403, {"error": "Your IP has been temporarily blocked."})
             return
 
-        # 检查暗号认证
-        if not self.check_authenticated():
-            self.send_response(403)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b'{"error": "Forbidden: Access code required"}')
+        # 2. 路由收敛白名单检测
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        is_qoder_chat = path in ("/qoder/v1/chat/completions", "/qoder/chat/completions")
+        is_wb_chat = path in ("/wb/v1/chat/completions", "/wb/chat/completions")
+        is_unified_chat = path in ("/v1/chat/completions", "/chat/completions")
+        is_anthropic = path in ("/v1/messages", "/qoder/v1/messages", "/qoder/messages")
+
+        if not (is_qoder_chat or is_wb_chat or is_unified_chat or is_anthropic):
+            record_failed_attempt(client_ip)
+            self.send_json(403, {"error": "Access Denied: Path not allowed by security policy."})
             return
 
-        # 检查是否为大模型推理接口（需经过温控熔断与单并发锁保护）
-        is_generation = any(self.path.startswith(p) for p in (
-            "/chat/completions",
-            "/v1/chat/completions",
-            "/completion",
-            "/infill"
-        ))
+        # 3. Bearer Key 鉴权门禁
+        if not self.verify_auth():
+            record_failed_attempt(client_ip)
+            self.send_json(401, {
+                "error": {
+                    "code": "invalid_api_key",
+                    "message": "Missing or invalid API key.",
+                    "type": "invalid_request_error"
+                }
+            })
+            return
 
-        if is_generation:
-            # 硬件温控熔断
-            temp = get_battery_temp()
-            if temp >= MAX_TEMP_CELSIUS:
-                self.send_response(429)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.end_headers()
-                err_msg = json.dumps({"error": f"手机当前机身温度较暖 ({temp:.1f}°C)，专属小管家正在休息降温中，请稍等 1~2 分钟后再试~"}).encode("utf-8")
-                self.wfile.write(err_msg)
-                return
+        # 4. 限流与温控安全检查
+        if is_rate_limited(client_ip):
+            self.send_json(429, {"error": "Rate limit exceeded."})
+            return
 
-            # 单并发互斥锁（严格限制同时 1 个推理，保 CPU 稳定）
-            acquired = inference_lock.acquire(timeout=60.0)
-            if not acquired:
-                self.send_response(503)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": "前方有小伙伴正在生成中，请稍候再试~"}).encode("utf-8"))
-                return
+        temp = get_battery_temp()
+        if temp >= MAX_TEMP_CELSIUS:
+            self.send_json(429, {
+                "error": f"Device thermal protection active ({temp:.1f}°C >= {MAX_TEMP_CELSIUS}°C). Cooling down, please retry in 1 minute."
+            })
+            return
 
-            try:
-                self.forward_to_backend("POST")
-            finally:
-                inference_lock.release()
-        else:
-            self.forward_to_backend("POST")
-
-    def forward_to_backend(self, method: str):
-        """将请求透明转发至 127.0.0.1:8080，完美支持 chunked 与 text/event-stream 流式输出"""
+        # 5. 读取 Body
         try:
-            conn = http.client.HTTPConnection(BACKEND_HOST, BACKEND_PORT, timeout=120)
-            
-            # 透传请求头
-            req_headers = {}
-            for k, v in self.headers.items():
-                if k.lower() not in ("host", "content-length"):
-                    req_headers[k] = v
+            content_length = int(self.headers.get("Content-Length", 0))
+            raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+            body_json = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+        except Exception as e:
+            self.send_json(400, {"error": f"Invalid JSON payload: {str(e)}"})
+            return
 
-            body = None
-            if method in ("POST", "PUT", "PATCH"):
-                content_length = int(self.headers.get("Content-Length", 0))
-                if content_length > 0:
-                    body = self.rfile.read(content_length)
-                req_headers["Content-Length"] = str(len(body) if body else 0)
+        model_name = body_json.get("model", "").lower().strip()
 
-            conn.request(method, self.path, body=body, headers=req_headers)
-            resp = conn.getresponse()
+        # 6. Anthropic Messages 透传（Qoder / Claude Code 第三方推理）
+        if is_anthropic:
+            self.stream_forward_chat(QODER_HOST, QODER_PORT, "/v1/messages", QODER_KEY, raw_body)
+            return
 
-            # 回传状态与响应头
-            self.send_response(resp.status)
-            is_stream = False
-            for k, v in resp.getheaders():
-                if k.lower() in ("transfer-encoding", "connection"):
-                    continue
-                if "text/event-stream" in v.lower():
-                    is_stream = True
-                self.send_header(k, v)
-            self.end_headers()
-
-            # 边读边写：如果是 SSE 流式响应，逐块 flush，带来丝般顺滑的打字机输出
-            if is_stream:
-                while True:
-                    chunk = resp.read(128)
-                    if not chunk:
-                        break
-                    try:
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError):
-                        break
+        # 7. 确定目标后端与鉴权 Key
+        if is_qoder_chat:
+            target_host, target_port, target_key = QODER_HOST, QODER_PORT, QODER_KEY
+            target_path = "/v1/chat/completions"
+        elif is_wb_chat:
+            target_host, target_port, target_key = WB_HOST, WB_PORT, WB_KEY
+            target_path = "/v1/chat/completions"
+        else:
+            # 智能统一分流
+            if any(k in model_name for k in ("qwen", "deepseek", "glm", "minimax")) or model_name in QODER_MODEL_HINTS:
+                target_host, target_port, target_key = QODER_HOST, QODER_PORT, QODER_KEY
+            elif model_name.startswith("cn:") or model_name.startswith("global:") or any(k in model_name for k in ("gpt", "grok", "hy", "step")):
+                target_host, target_port, target_key = WB_HOST, WB_PORT, WB_KEY
+            elif model_name == "qwen2.5-3b":
+                target_host, target_port, target_key = LOCAL_LLM_HOST, LOCAL_LLM_PORT, ""
             else:
-                while True:
-                    chunk = resp.read(4096)
-                    if not chunk:
-                        break
-                    try:
-                        self.wfile.write(chunk)
-                    except (BrokenPipeError, ConnectionResetError):
-                        break
+                # 默认走 QoderGateway
+                target_host, target_port, target_key = QODER_HOST, QODER_PORT, QODER_KEY
+            target_path = "/v1/chat/completions"
+
+        # 7. 透传请求并流式实时写回
+        self.stream_forward_chat(target_host, target_port, target_path, target_key, raw_body)
+
+    def forward_single_models(self, host: str, port: int, key: str):
+        """转发单个后端的 /v1/models 接口"""
+        try:
+            conn = self.make_conn(host, port, 10)
+            headers = {"Authorization": f"Bearer {key}"} if key else {}
+            conn.request("GET", "/v1/models", headers=headers)
+            resp = conn.getresponse()
+            data = resp.read()
+            conn.close()
+
+            self.send_response(resp.status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            self.send_json(502, {"error": f"Failed to fetch models from backend: {str(e)}"})
+
+    def handle_aggregated_models(self):
+        """聚合返回 Qoder 与 WorkBuddy 的全量模型列表"""
+        all_models = []
+        seen_ids = set()
+
+        # 1. 抓取 QoderGateway 模型
+        try:
+            conn = self.make_conn(QODER_HOST, QODER_PORT, 5)
+            conn.request("GET", "/v1/models", headers={"Authorization": f"Bearer {QODER_KEY}"})
+            resp = conn.getresponse()
+            if resp.status == 200:
+                q_data = json.loads(resp.read().decode("utf-8"))
+                for m in q_data.get("data", []):
+                    m_id = m.get("id")
+                    if m_id and m_id not in seen_ids:
+                        seen_ids.add(m_id)
+                        all_models.append(m)
             conn.close()
         except Exception as e:
+            print(f"[WARN] Aggregator failed to fetch Qoder models: {e}")
+
+        # 2. 抓取 WorkBuddy 模型
+        try:
+            conn2 = http.client.HTTPConnection(WB_HOST, WB_PORT, timeout=5)
+            conn2.request("GET", "/v1/models", headers={"Authorization": f"Bearer {WB_KEY}"})
+            resp2 = conn2.getresponse()
+            if resp2.status == 200:
+                wb_data = json.loads(resp2.read().decode("utf-8"))
+                for m in wb_data.get("data", []):
+                    m_id = m.get("id")
+                    if m_id and m_id not in seen_ids:
+                        seen_ids.add(m_id)
+                        all_models.append(m)
+            conn2.close()
+        except Exception as e:
+            print(f"[WARN] Aggregator failed to fetch WorkBuddy models: {e}")
+
+        payload = {
+            "object": "list",
+            "data": all_models
+        }
+        self.send_json(200, payload)
+
+    def stream_forward_chat(self, host: str, port: int, path: str, key: str, body: bytes):
+        """向目标后端转发 POST 对话，支持实时 SSE 逐块打字机输出"""
+        try:
+            conn = self.make_conn(host, port, 180)
+            req_headers = {
+                "Content-Type": "application/json",
+                "Accept": self.headers.get("Accept", "*/*"),
+                "Content-Length": str(len(body)),
+            }
+            if key:
+                req_headers["Authorization"] = f"Bearer {key}"
+            if self.client_usage_key:
+                req_headers["X-Qoder-Usage-Key"] = self.client_usage_key
+
+            conn.request("POST", path, body=body, headers=req_headers)
+            resp = conn.getresponse()
+
+            self.send_response(resp.status)
+            is_sse = False
+            for k, v in resp.getheaders():
+                kl = k.lower()
+                if kl in ("transfer-encoding", "connection"):
+                    continue
+                if "text/event-stream" in v.lower():
+                    is_sse = True
+                self.send_header(k, v)
+            
+            if is_sse or not resp.getheader("Content-Length"):
+                self.send_header("Connection", "close")
+                self.close_connection = True
+
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "*")
+            self.end_headers()
+
+            # 边读边刷：若是 SSE 流式，逐 64 字节 flush，保证极佳打字机体验
+            chunk_size = 64 if is_sse else 4096
+            while True:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                    if is_sse:
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+            conn.close()
             try:
-                self.send_response(502)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": f"Bad Gateway: {str(e)}"}).encode("utf-8"))
+                self.wfile.flush()
+            except Exception:
+                pass
+            # TLS 流式响应结束时完成 close_notify 握手，避免客户端把正常收尾判为网络错误
+            if isinstance(self.connection, ssl.SSLSocket):
+                try:
+                    self.connection.settimeout(2)
+                    self.connection.unwrap()
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.send_json(502, {"error": f"Upstream connection failed: {str(e)}"})
             except Exception:
                 pass
 
+
 def main():
-    print(f"[*] 启动 OnePlus 9 官方 WebUI 流式全反代网关...")
-    print(f"[*] 监听端口: {PORT} -> 后端: {BACKEND_HOST}:{BACKEND_PORT}")
-    print(f"[*] 访问暗号: {ACCESS_CODE} | 温控阈值: {MAX_TEMP_CELSIUS}°C")
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), PublicStreamingProxyHandler)
+    print("=" * 60)
+    print(f"[*] 启动 OnePlus 9 双反代安全融合网关 (127.0.0.1:{PORT})")
+    print(f"[*] 聚合上游: QoderGateway (:5050, HTTPS) & WorkBuddy (:7863)")
+    print("[*] 安全策略: 仅放行 /v1 API，严禁暴露 /console 与管理路径")
+    print("=" * 60)
+    gateway_tokens.init_db()
+    print("[*] Token 鉴权: SQLite 哈希存储 (可吊销/可审计)")
+    http_server = ThreadingHTTPServer(("127.0.0.1", PORT), DualProxyHandler)
+    https_server = None
+    if os.path.exists(TLS_CERT_FILE) and os.path.exists(TLS_KEY_FILE):
+        try:
+            https_server = ThreadingHTTPServer(("0.0.0.0", LAN_HTTPS_PORT), DualProxyHandler)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certfile=TLS_CERT_FILE, keyfile=TLS_KEY_FILE)
+            https_server.socket = context.wrap_socket(https_server.socket, server_side=True)
+            threading.Thread(target=https_server.serve_forever, daemon=True).start()
+            print(f"[*] 局域网 HTTPS API: https://0.0.0.0:{LAN_HTTPS_PORT}")
+        except Exception as exc:
+            print(f"[!] 局域网 HTTPS 启动失败: {exc}")
+    else:
+        print(f"[!] 未找到证书，局域网 HTTPS 未启用: {TLS_CERT_FILE}")
     try:
-        server.serve_forever()
+        http_server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[!] 正在停止网关服务...")
-        server.server_close()
+        print("\n[!] 网关正在安全停止...")
+        http_server.server_close()
+        if https_server is not None:
+            https_server.server_close()
+
 
 if __name__ == "__main__":
     main()
