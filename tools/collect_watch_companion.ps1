@@ -25,7 +25,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # This collector is for the daily vivo phone, never the OnePlus 9 server.
-if ($Serial -eq '<OP9_ADB_SERIAL>' -or $Serial -like '192.168.31.172*') {
+if (($env:OP9_ADB_SERIAL -and $Serial -eq $env:OP9_ADB_SERIAL) -or $Serial -like '192.168.31.172*') {
     throw 'Select the daily vivo phone. Server administration must use SSH.'
 }
 $adbCommand = Get-Command -Name $AdbPath -CommandType Application -ErrorAction Stop

@@ -9,7 +9,7 @@
 1. **设备规格**：一加 9 国行版（LE2110，高通骁龙 888 8核 CPU，12GB LPDDR5 RAM，256GB UFS 3.1 ROM）。
 2. **系统形态**：免 Root (No-Root) 模式，ColorOS / Android 13 原厂固件，前台锁存 Termux (`termux-wake-lock`)。
 3. **容器架构**：双层结构 —— Termux (Android 宿主环境) + PRoot Debian 12 (bookworm) ARM64 原生环境。
-4. **网络基线**：局域网静态分配 IP 为 `192.168.31.172`，ADB 物理识别号为 `<OP9_ADB_SERIAL>`。
+4. **网络基线**：局域网静态分配 IP 为 `192.168.31.172`；ADB 设备序列号属于设备标识，**不入库**，脚本统一从环境变量 `OP9_ADB_SERIAL` 注入（本机 `adb devices` 可查）。
 
 ---
 

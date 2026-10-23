@@ -1,4 +1,7 @@
-import subprocess, time
+import subprocess, time, os
+
+# 设备序列号不入库：从环境变量注入（export OP9_ADB_SERIAL=xxxx）
+ADB_TARGET_ARGS = ["-s", os.environ["OP9_ADB_SERIAL"]] if os.environ.get("OP9_ADB_SERIAL") else []
 
 PACKAGES_TO_DISABLE = [
     # 1. 商业推广与金融借贷
@@ -42,7 +45,7 @@ APPS_TO_STOP = [
 ]
 
 def get_mem():
-    out = subprocess.check_output(["adb", "-s", "<OP9_ADB_SERIAL>", "shell", "cat", "/proc/meminfo"]).decode()
+    out = subprocess.check_output(["adb", *ADB_TARGET_ARGS, "shell", "cat", "/proc/meminfo"]).decode()
     total = 0
     avail = 0
     free = 0
@@ -65,7 +68,7 @@ print(f"总内存: {tot_before:.1f} MB | 可用内存: {avail_before:.1f} MB | �
 print("=== 开始批量冻结/停用冗余系统预装组件 (pm disable-user --user 0) ===")
 disabled_success = []
 for pkg in PACKAGES_TO_DISABLE:
-    res = subprocess.run(["adb", "-s", "<OP9_ADB_SERIAL>", "shell", f"pm disable-user --user 0 {pkg}"], capture_output=True, text=True)
+    res = subprocess.run(["adb", *ADB_TARGET_ARGS, "shell", f"pm disable-user --user 0 {pkg}"], capture_output=True, text=True)
     out = res.stdout.strip() or res.stderr.strip()
     if "disabled" in out or "new state" in out:
         print(f"[OK] 已成功冻结: {pkg}")
@@ -77,11 +80,11 @@ for pkg in PACKAGES_TO_DISABLE:
 
 print("\n=== 正在关闭前台残留无用应用 ===")
 for app in APPS_TO_STOP:
-    subprocess.run(["adb", "-s", "<OP9_ADB_SERIAL>", "shell", f"am force-stop {app}"])
+    subprocess.run(["adb", *ADB_TARGET_ARGS, "shell", f"am force-stop {app}"])
     print(f"[OK] 已终止残留应用: {app}")
 
 # 强制触发一次 trim memory
-subprocess.run(["adb", "-s", "<OP9_ADB_SERIAL>", "shell", "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true"])
+subprocess.run(["adb", *ADB_TARGET_ARGS, "shell", "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true"])
 time.sleep(3)
 
 print("\n=== 正在读取优化后内存数据 ===")

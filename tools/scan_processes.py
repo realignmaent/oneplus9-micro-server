@@ -1,7 +1,10 @@
-import subprocess, json, re
+import subprocess, json, re, os
 
-mem_out = subprocess.check_output(['adb', '-s', '<OP9_ADB_SERIAL>', 'shell', 'dumpsys', 'meminfo']).decode('utf-8', errors='ignore')
-top_out = subprocess.check_output(['adb', '-s', '<OP9_ADB_SERIAL>', 'shell', 'top', '-b', '-n', '1']).decode('utf-8', errors='ignore')
+# 设备序列号不入库：从环境变量注入（export OP9_ADB_SERIAL=xxxx）
+ADB_TARGET_ARGS = ['-s', os.environ['OP9_ADB_SERIAL']] if os.environ.get('OP9_ADB_SERIAL') else []
+
+mem_out = subprocess.check_output(['adb', *ADB_TARGET_ARGS, 'shell', 'dumpsys', 'meminfo']).decode('utf-8', errors='ignore')
+top_out = subprocess.check_output(['adb', *ADB_TARGET_ARGS, 'shell', 'top', '-b', '-n', '1']).decode('utf-8', errors='ignore')
 
 # parse top cpu
 cpu_map = {}
