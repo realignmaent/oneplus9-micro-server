@@ -126,10 +126,10 @@ latest_metrics = {
         "prime": 0
     },
     "battery": {
-        "level": 70,
+        "level": None,
         "temp": 26.8,
         "voltage": 3.94,
-        "status": "未充电 🔌"
+        "status": "遥测初始化..."
     },
     "ram": {"total_mb": 11230, "used_mb": 0, "avail_mb": 0, "pct": 0.0},
     "zram": {"total_mb": 7679, "used_mb": 0, "free_mb": 7679, "pct": 0.0},
@@ -334,7 +334,7 @@ def read_thermal_matrix():
     temps["status"] = "HIGH" if temps["battery"] >= 42.0 or temps["cpu_max"] >= 65.0 else "NORMAL"
     return temps
 
-cached_battery_data = {"level": 70, "status": "未充电 🔌", "ts": 0}
+cached_battery_data = {"level": None, "status": "遥测初始化...", "ts": 0, "ok_ts": 0}
 
 def get_battery_status_cached():
     """10秒缓存极速获取手机硬件电量与充电状态"""
@@ -343,8 +343,8 @@ def get_battery_status_cached():
     if now_t - cached_battery_data["ts"] < 10:
         return cached_battery_data["level"], cached_battery_data["status"]
     
-    level = cached_battery_data["level"]
-    status_str = cached_battery_data["status"]
+    level = cached_battery_data.get("level")
+    status_str = cached_battery_data.get("status")
     try:
         out = subprocess.check_output(
             ["adb", "-s", "127.0.0.1:5555", "shell", "dumpsys", "battery"],
@@ -359,9 +359,13 @@ def get_battery_status_cached():
                 st = int(line.split(":")[1].strip())
                 charging = (st == 2)
         status_str = "充电中 ⚡" if charging else ("已充满 ✨" if level >= 100 else "未充电 🔌")
-        cached_battery_data = {"level": level, "status": status_str, "ts": now_t}
+        cached_battery_data = {"level": level, "status": status_str, "ts": now_t, "ok_ts": now_t}
     except Exception:
         cached_battery_data["ts"] = now_t
+        # 连续 120s 取不到 ADB 数据就明确报不可用，避免把旧值当实时数据展示
+        if now_t - cached_battery_data.get("ok_ts", 0) > 120:
+            level = None
+            status_str = "遥测不可用 (ADB 未连接)"
     return level, status_str
 
 def read_cpu_freqs():
@@ -1353,7 +1357,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         document.getElementById('dash-cpu-temp').innerText = data.thermals.cpu_max + '°C';
         if (data.battery) {
           if (document.getElementById('dash-bat-level') && data.battery.level !== undefined) {
-            document.getElementById('dash-bat-level').innerText = data.battery.level + '%';
+            document.getElementById('dash-bat-level').innerText = (data.battery.level === null) ? '--' : data.battery.level + '%';
           }
           document.getElementById('dash-bat-temp').innerText = data.battery.temp + '°C';
           document.getElementById('bat-voltage').innerText = data.battery.voltage + ' V';
