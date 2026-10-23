@@ -54,10 +54,17 @@
   `WatchFaceDeviceProvider` 需 `com.oppo.permission.safe.IOT` 三处硬限制锁死；
   配套采集脚本 `tools/collect_watch_companion.ps1`，证据目录 `artifacts/watch-w301cn/` 已加入忽略。
 
+## 运行监控（2026-10-23）
+
+- **健康总览条**（`:5701` 微服务卡片上方）：在线数、累计重启次数、公网探活结果与时间、异常服务名单。
+- **每服务重启计数**：状态变更写入 `metrics_history.db` 的 `service_events` 表，控制台自身重启后不清零；卡片上显示“重启 N”。
+- **24h 趋势图**：每 30s 采样 CPU 温度 / 1m 负载 / 已用内存，保留 7 天；`/api/history?hours=N` 返回降采样数据，右上角 ECharts 折线展示。
+- **外部可用性探活**（`tools/health_probe.py`，cron 每 5 分钟）：探测 8 个本地端口 + 隧道公网 `/health`，结果写 `~/logs/health_probe.json` 供控制台读取；失败走多通道告警并做 30 分钟节流。
+- **守护补强**：`start_qinglong_daemon.sh` 增加 cloudflared 存活检查（进程缺失、或公网 `/health` 连续两次失败则重启并刷新 `public_url.txt`）；crontab 补 `*/2` 守护心跳与 `*/5` 探活任务。
+
 ## 已知待跟进
 
-1. `start_qinglong_daemon.sh` 目前**不守护 cloudflared**，手机重启或网络抖动后隧道会掉，
-   且快速隧道 URL 每次重启都可能变化；要稳定公网地址需上 Cloudflare 命名隧道 + 自有域名。
+1. 快速隧道 URL 每次重启都会变化，`public_url.txt` 与控制台/朋友页会自动更新，但客户端手填的地址不会；要稳定入口仍需 Cloudflare 命名隧道 + 自有域名。
 2. 手机端实跑的 `public_ai_gateway.py` 仍是硬编码 Key 的历史副本，与仓库快照存在这一处差异。
-3. 一加 9 上 Tailscale 已被卸载，朋友侧 Tailscale 通道（含 `100.x` 地址与对应证书 SAN）不可用，
-   需重装登录并重新签发带新 SAN 的叶子证书。
+3. 一加 9 上 Tailscale 已被卸载，朋友侧 Tailscale 通道（含 `100.x` 地址与对应证书 SAN）不可用，需重装登录并重新签发带新 SAN 的叶子证书。
+4. 历史上已推送过 PushPlus / WxPusher 凭据，代码现已改为只读环境变量，但**旧凭据需在对应后台轮换**才算真正失效。

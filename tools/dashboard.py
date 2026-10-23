@@ -10,6 +10,7 @@ import sys
 import glob
 import time
 import json
+import sqlite3
 import socket
 import subprocess
 import threading
@@ -139,8 +140,110 @@ latest_metrics = {
         "cost_s": 0.0
     },
     "sankey_data": {"nodes": [], "links": []},
-    "services": {}
+    "services": {},
+    "health": {"up": 0, "total": 0, "restarts": 0, "public": None}
 }
+
+# ─── 服务健康与历史遥测 ────────────────────────────────────────────────
+HISTORY_DB = os.path.join(HOME_DIR, "metrics_history.db")
+HISTORY_KEEP_DAYS = 7
+SAMPLE_EVERY_S = 30
+SERVICE_HEALTH = {}
+_last_sample_ts = 0
+
+
+def init_history_db():
+    try:
+        conn = sqlite3.connect(HISTORY_DB, timeout=3)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS samples ("
+            "ts INTEGER PRIMARY KEY, cpu_max REAL, load1 REAL, ram_used_mb INTEGER, bat_level INTEGER)"
+        )
+        conn.execute("CREATE TABLE IF NOT EXISTS service_events (ts INTEGER, service TEXT, event TEXT)")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def record_event(ts, service, event):
+    try:
+        conn = sqlite3.connect(HISTORY_DB, timeout=2)
+        conn.execute("INSERT INTO service_events VALUES (?,?,?)", (int(ts), service, event))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def load_health_state():
+    """从历史事件恢复重启次数与最后一次异常时间（控制台自身重启后不清零）"""
+    try:
+        conn = sqlite3.connect(HISTORY_DB, timeout=2)
+        rows = conn.execute(
+            "SELECT service, SUM(event='up'), MAX(CASE WHEN event='down' THEN ts ELSE 0 END) "
+            "FROM service_events GROUP BY service"
+        ).fetchall()
+        conn.close()
+        for svc, ups, last_down in rows:
+            SERVICE_HEALTH[svc] = {
+                "up": None,
+                "since": int(time.time()),
+                "restarts": int(ups or 0),
+                "last_down": int(last_down or 0),
+            }
+    except Exception:
+        pass
+
+
+def record_sample(ts, thermals, load_avg, mem_data, bat_lvl):
+    global _last_sample_ts
+    if ts - _last_sample_ts < SAMPLE_EVERY_S:
+        return
+    _last_sample_ts = ts
+    try:
+        conn = sqlite3.connect(HISTORY_DB, timeout=3)
+        conn.execute(
+            "INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?)",
+            (
+                int(ts),
+                float(thermals.get("cpu_max") or 0),
+                float(load_avg[0] if load_avg else 0),
+                int(mem_data["ram"].get("used_mb") or 0),
+                int(bat_lvl or 0),
+            ),
+        )
+        conn.execute("DELETE FROM samples WHERE ts < ?", (int(ts) - HISTORY_KEEP_DAYS * 86400,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def load_history(hours=24):
+    try:
+        since = int(time.time()) - hours * 3600
+        conn = sqlite3.connect(HISTORY_DB, timeout=3)
+        rows = conn.execute(
+            "SELECT ts,cpu_max,load1,ram_used_mb,bat_level FROM samples WHERE ts>=? ORDER BY ts",
+            (since,),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return []
+    if len(rows) > 720:
+        stride = len(rows) // 720 + 1
+        rows = rows[::stride]
+    return [{"t": r[0] * 1000, "cpu": r[1], "load": r[2], "ram": r[3], "bat": r[4]} for r in rows]
+
+
+def read_public_probe():
+    try:
+        with open(os.path.join(HOME_DIR, "logs", "health_probe.json"), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 def get_uptime_and_load():
     """解析系统真实在线时长与 1/5/15 分钟负载"""
@@ -478,6 +581,32 @@ def metrics_collector_loop():
                     except OSError:
                         pass
 
+            # 健康状态跟踪：重启次数、最后异常时间、已持续在线时长
+            for s_key, info in services_status.items():
+                st = SERVICE_HEALTH.get(s_key)
+                if st is None:
+                    st = {"up": None, "since": int(now), "restarts": 0, "last_down": 0}
+                    SERVICE_HEALTH[s_key] = st
+                now_up = bool(info.get("running"))
+                if st["up"] is None:
+                    st["up"] = now_up
+                    st["since"] = int(now)
+                    if not now_up:
+                        st["last_down"] = int(now)
+                elif now_up != st["up"]:
+                    if now_up:
+                        st["restarts"] += 1
+                        st["since"] = int(now)
+                        record_event(now, s_key, "up")
+                    else:
+                        st["last_down"] = int(now)
+                        record_event(now, s_key, "down")
+                    st["up"] = now_up
+                info["restarts"] = st["restarts"]
+                info["up_since"] = st["since"] if now_up else 0
+                info["last_down"] = st["last_down"]
+                info["up_seconds"] = int(now) - st["since"] if now_up else 0
+
             sankey_tree = get_process_memory_tree(mem_data, services_status)
 
             with metrics_lock:
@@ -498,6 +627,13 @@ def metrics_collector_loop():
                     "temp": thermals["battery"],
                     "voltage": thermals["vbat"],
                     "status": bat_st
+                }
+                record_sample(now, thermals, load_avg, mem_data, bat_lvl)
+                latest_metrics["health"] = {
+                    "up": sum(1 for s in services_status.values() if s.get("running")),
+                    "total": len(services_status),
+                    "restarts": sum(int(s.get("restarts") or 0) for s in services_status.values()),
+                    "public": read_public_probe(),
                 }
                 latest_metrics["cpu_cores_temp"] = thermals["cpu_cores"]
                 latest_metrics["ram"] = mem_data["ram"]
@@ -739,6 +875,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             </button>
           </div>
 
+          <!-- 健康总览条：在线数 / 累计重启 / 公网探活 / 异常服务 -->
+          <div id="health-strip" class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] font-mono px-2.5 py-1.5 rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200/80 dark:border-slate-800/80"></div>
+
           <!-- Services Grid (双列卡片自适应填满) -->
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5" id="services-grid"></div>
         </section>
@@ -760,6 +899,18 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         <div class="bg-white dark:bg-[#131926] rounded-2xl p-4 sm:p-5 border border-slate-200/90 dark:border-slate-800/80 shadow-xs flex-1 flex flex-col min-h-[540px] xl:min-h-[640px]">
           <div id="sankey-chart" class="w-full flex-1 min-h-[520px] xl:min-h-[610px]"></div>
+        </div>
+
+        <!-- 24h 历史趋势 -->
+        <div class="bg-white dark:bg-[#131926] rounded-2xl p-3.5 sm:p-4 border border-slate-200/90 dark:border-slate-800/80 shadow-xs">
+          <div class="flex items-center justify-between mb-2">
+            <h2 class="text-xs font-bold text-slate-900 dark:text-white flex items-center gap-2">
+              <i class="fa-solid fa-chart-line text-emerald-600"></i>
+              <span>24h 趋势 · 温度 / 负载 / 内存</span>
+            </h2>
+            <span id="history-summary" class="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400">采样中...</span>
+          </div>
+          <div id="history-chart" class="w-full" style="height:190px"></div>
         </div>
       </div>
 
@@ -1090,6 +1241,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
               <div class="flex items-center gap-3 text-[11px] text-slate-500 dark:text-slate-400 font-mono mt-1.5 mb-2.5">
                 <span>PID: <b class="text-slate-800 dark:text-slate-200 font-semibold">${s.pid || '--'}</b></span>
                 <span>内存: <b class="text-slate-800 dark:text-slate-200 font-semibold">${s.memory_mb ? s.memory_mb + ' MB' : '--'}</b></span>
+                <span>重启: <b class="text-slate-800 dark:text-slate-200 font-semibold">${s.restarts || 0}</b></span>
               </div>
             </div>
 
@@ -1112,6 +1264,64 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         `;
       }).join('');
     }
+
+    function renderHealthStrip(services, health) {
+      const el = document.getElementById('health-strip');
+      if (!el) return;
+      const list = Object.values(services || {});
+      const up = list.filter(s => s.running).length;
+      const total = list.length;
+      const restarts = list.reduce((a, s) => a + (s.restarts || 0), 0);
+      const down = list.filter(s => !s.running).map(s => s.name);
+      const pub = health && health.public;
+      let pubHtml = '<span class="text-slate-400">公网 未探测</span>';
+      if (pub && pub.ts) {
+        const t = new Date(pub.ts * 1000).toLocaleTimeString('zh-CN', {hour12: false});
+        pubHtml = pub.ok
+          ? `<span class="text-emerald-600 dark:text-emerald-400">公网 ✓ ${t}</span>`
+          : `<span class="text-rose-600 dark:text-rose-400">公网 ✗ ${t}</span>`;
+      }
+      el.innerHTML = `
+        <span class="text-slate-600 dark:text-slate-300">在线 <b class="text-emerald-600 dark:text-emerald-400">${up}/${total}</b></span>
+        <span class="text-slate-600 dark:text-slate-300">累计重启 <b class="${restarts ? 'text-amber-600 dark:text-amber-400' : 'text-slate-700 dark:text-slate-200'}">${restarts}</b></span>
+        ${pubHtml}
+        ${down.length ? `<span class="text-rose-600 dark:text-rose-400 truncate">异常: ${down.join(' / ')}</span>` : '<span class="text-emerald-600 dark:text-emerald-400">全部正常</span>'}
+      `;
+    }
+
+    let historyChart = null;
+    async function renderHistory() {
+      const el = document.getElementById('history-chart');
+      if (!el) return;
+      try {
+        const res = await fetch('/api/history?hours=24&_t=' + Date.now(), {cache: 'no-store'});
+        const data = await res.json();
+        const s = data.samples || [];
+        const summary = document.getElementById('history-summary');
+        if (summary) summary.innerText = s.length ? `${s.length} 采样点 · 最近 ${data.hours}h` : '暂无样本';
+        if (!s.length) return;
+        if (!historyChart) historyChart = echarts.init(el);
+        historyChart.setOption({
+          animation: false,
+          grid: {left: 36, right: 40, top: 18, bottom: 18},
+          tooltip: {trigger: 'axis'},
+          legend: {show: true, top: 0, itemWidth: 10, itemHeight: 6, textStyle: {fontSize: 9}},
+          xAxis: {type: 'time', axisLabel: {fontSize: 9}},
+          yAxis: [
+            {type: 'value', name: '°C', nameTextStyle: {fontSize: 9}, axisLabel: {fontSize: 9}, splitLine: {show: false}},
+            {type: 'value', name: 'GB / Load', nameTextStyle: {fontSize: 9}, axisLabel: {fontSize: 9}, splitLine: {show: false}}
+          ],
+          series: [
+            {name: 'CPU温度', type: 'line', showSymbol: false, smooth: true, data: s.map(p => [p.t, p.cpu]), lineStyle: {width: 1.5}},
+            {name: '内存GB', type: 'line', showSymbol: false, smooth: true, yAxisIndex: 1, data: s.map(p => [p.t, +(p.ram / 1024).toFixed(2)]), lineStyle: {width: 1.5}},
+            {name: '负载1m', type: 'line', showSymbol: false, smooth: true, yAxisIndex: 1, data: s.map(p => [p.t, p.load]), lineStyle: {width: 1.2, type: 'dashed'}}
+          ]
+        });
+        historyChart.resize();
+      } catch (e) {}
+    }
+    setInterval(renderHistory, 60000);
+    setTimeout(renderHistory, 2500);
 
     async function fetchMetrics() {
       if (isFetching) return;
@@ -1179,6 +1389,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         // Section 3: 微服务矩阵
         renderServices(data.services);
+        renderHealthStrip(data.services, data.health);
 
       } catch (e) {
         console.error("Fetch metrics error:", e);
@@ -1278,6 +1489,35 @@ class ConsoleHTTPHandler(BaseHTTPRequestHandler):
             self.send_json(200, data)
             return
 
+        # 服务健康摘要（含重启次数与最后一次异常）
+        if self.path.startswith("/api/health"):
+            with metrics_lock:
+                health = dict(latest_metrics.get("health") or {})
+                svcs = latest_metrics.get("services") or {}
+            health["services"] = {
+                k: {
+                    "running": v.get("running"),
+                    "restarts": v.get("restarts", 0),
+                    "last_down": v.get("last_down", 0),
+                    "up_seconds": v.get("up_seconds", 0),
+                    "port": v.get("port"),
+                    "name": v.get("name"),
+                }
+                for k, v in svcs.items()
+            }
+            self.send_json(200, health)
+            return
+
+        # 历史采样（默认 24h，最多 7 天）
+        if self.path.startswith("/api/history"):
+            qs = parse_qs(urlparse(self.path).query)
+            try:
+                hours = max(1, min(168, int(qs.get("hours", ["24"])[0])))
+            except Exception:
+                hours = 24
+            self.send_json(200, {"hours": hours, "samples": load_history(hours)})
+            return
+
         # 日志读取
         if self.path.startswith("/api/service/logs"):
             qs = parse_qs(urlparse(self.path).query)
@@ -1359,6 +1599,9 @@ class ConsoleHTTPHandler(BaseHTTPRequestHandler):
 def main():
     print(f"[*] 启动 OnePlus 9 移动微服务器一体化控制台 (AI巡检+桑基图版)...")
     print(f"[*] 监听端口: 0.0.0.0:{PORT}")
+
+    init_history_db()
+    load_health_state()
 
     t = threading.Thread(target=metrics_collector_loop, daemon=True)
     t.start()
