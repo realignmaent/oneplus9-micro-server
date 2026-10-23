@@ -37,3 +37,6 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Local watch research evidence (installed APKs and device metadata)
+/artifacts/watch-w301cn/
